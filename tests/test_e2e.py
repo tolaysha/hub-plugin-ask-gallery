@@ -31,6 +31,21 @@ CTX = ("(() => { const s = document.querySelector('.ag-layer .ag-slide:not([iner
        " scrolls: b.scrollHeight > b.clientHeight + 1 && getComputedStyle(b).overflowY === 'auto', h: Math.round(b.clientHeight),"
        " more: (() => { const m = c.querySelector('.ag-ctx-more'); return m && !m.hidden && getComputedStyle(m).display !== 'none' ? m.textContent : null; })(),"
        " acts: c.querySelectorAll('.reply-btn, .react-add, .quote-jump[role]').length, md: c.querySelectorAll('strong').length}; })()")
+# the widths of the shown slide: the context and the card, the handles (their middle, value, role), what is kept
+WID = ("(() => { const s = document.querySelector('.ag-layer .ag-slide:not([inert])'); if (!s) return null;"
+       " const w = (q) => { const n = s.querySelector(q); return n && n.getClientRects().length ? Math.round(n.getBoundingClientRect().width) : null; };"
+       " const g = (q) => { const n = s.querySelector(q); if (!n || !n.getClientRects().length) return null; const r = n.getBoundingClientRect();"
+       " return {x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2), now: +n.getAttribute('aria-valuenow'),"
+       " max: +n.getAttribute('aria-valuemax'), role: n.getAttribute('role'), tab: n.tabIndex, cursor: getComputedStyle(n).cursor}; };"
+       " const x = s.getBoundingClientRect();"
+       " return {ctx: w(':scope > .ag-ctx'), card: w(':scope > .card'), split: g('.ag-split'), edge: g('.ag-edge'),"
+       " kept: JSON.parse(localStorage.getItem('ask-gallery.widths')), left: Math.round(x.left), right: Math.round(x.right), vw: innerWidth}; })()")
+SPLIT = ".ag-layer .ag-slide:not([inert]) .ag-split"
+EDGE = ".ag-layer .ag-slide:not([inert]) .ag-edge"
+# a point to drag a handle to: the mouse goes to the middle of this 1px mark
+TO = ("(() => { let t = document.getElementById('ag-to'); if (!t) { t = document.createElement('div'); t.id = 'ag-to';"
+      " t.style.cssText = 'position: fixed; width: 1px; height: 1px; pointer-events: none'; document.body.append(t); }"
+      " t.style.left = '%dpx'; t.style.top = '%dpx'; return 1; })()")
 OPEN = ".slot-session-header .ag-open:not([hidden])"
 LAYER = ".ag-layer"
 COUNT = "document.querySelector('.ag-layer .ag-count')?.textContent"
@@ -491,3 +506,95 @@ class Gallery(e2e.PageInChrome):
         self.assertEqual(got[-4]["eval"], "orders retry")                # Space is a space in the field
         self.assertEqual(got[-1]["eval"], 0)
         self.assertNotIn("r1", self.pending())
+
+    def test_the_widths_of_the_context_and_the_card_are_dragged_kept_and_reset(self):
+        m = self.j.append("message.received", None, {"to": "backend", "text": "Посмотри логи", "channel": "web", "owner": True})
+        self.ev("turn.started", "backend", marker=f"m{m['seq']}")
+        self.ev("session.said", "backend", text="Смотрю логи сервиса после выката.")
+        self.ask("r1", "Откатываем выпуск?")
+        self.ask("r2", "Второй?")   # no text of the turn right before it: the card alone
+        broken = """localStorage.setItem('ask-gallery.widths', '{"ctx": "wide", "card": -5}')"""   # not ours: the defaults
+        got = self.opened(self.shot("widths-default.png"), {"until": f"{CTX}?.rows.length === 1", "ms": 8000}, {"eval": WID}, init=broken)
+        w = got[-1]["eval"]
+        self.assertEqual((w["ctx"], w["card"]), (380, 680))
+        self.assertEqual((w["split"]["role"], w["split"]["tab"], w["split"]["now"]), ("separator", 0, 380))
+        self.assertEqual((w["edge"]["now"], w["split"]["cursor"]), (680, "col-resize"))
+        self.assertEqual(w["kept"], {"ctx": "wide", "card": -5})
+        # a click with a shaky hand: the widths stay, nothing is kept over what was
+        got = self.page({"eval": TO % (w["split"]["x"] + 2, w["split"]["y"] + 30)}, {"drag": SPLIT, "to": "#ag-to"}, {"eval": WID})
+        self.assertEqual((got[-1]["eval"]["ctx"], got[-1]["eval"]["kept"]), (380, {"ctx": "wide", "card": -5}))
+        # the divider: the context gets wider, the card narrower by as much, the pair stays where it was
+        got = self.page({"eval": TO % (w["split"]["x"] + 120, w["split"]["y"])}, {"drag": SPLIT, "to": "#ag-to"}, {"eval": WID})
+        d = got[-1]["eval"]
+        self.assertAlmostEqual(d["ctx"], 500, delta=2)
+        self.assertAlmostEqual(d["card"], 560, delta=2)
+        self.assertEqual((d["left"], d["right"]), (w["left"], w["right"]))
+        self.assertEqual(d["kept"], {"ctx": d["ctx"], "card": d["card"]})
+        # the card's outer edge: the card grows, the pair stays in the middle (twice the move)
+        got = self.page({"eval": TO % (d["edge"]["x"] + 60, d["edge"]["y"])}, {"drag": EDGE, "to": "#ag-to"}, {"eval": WID},
+                        self.shot("widths-dragged.png"))
+        e = got[2]["eval"]
+        self.assertEqual(e["ctx"], d["ctx"])
+        self.assertAlmostEqual(e["card"], d["card"] + 120, delta=3)
+        self.assertEqual(e["kept"], {"ctx": e["ctx"], "card": e["card"]})
+        # out of the mode and back: the same widths
+        same = f"{WID}?.ctx === {e['ctx']} && {WID}.card === {e['card']}"
+        self.page({"key": "Escape"}, {"until": f"!document.querySelector('{LAYER}')"},
+                  {"eval": f"document.querySelector('{OPEN}').click(), 1"}, {"until": same, "ms": 8000})
+        # Tab goes as the eye does: the context, the divider, the card, the card's edge
+        order = ("(() => { const s = document.querySelector('.ag-layer .ag-slide:not([inert])'), all = [...s.querySelectorAll("
+                 "'button, input, textarea, [tabindex]:not([tabindex=\\'-1\\'])')].filter((n) => n.getClientRects().length);"
+                 " const i = (n) => all.indexOf(n), card = s.querySelector(':scope > .card');"
+                 " return [i(s.querySelector('.ag-split')), Math.min(...all.filter((n) => card.contains(n)).map(i)),"
+                 " Math.max(...all.filter((n) => card.contains(n)).map(i)), i(s.querySelector('.ag-edge'))]; })()")
+        got = self.page({"eval": order})
+        sp, first, last, ed = got[0]["eval"]
+        self.assertTrue(0 <= sp < first <= last < ed, got[0]["eval"])
+        # the keyboard: ←/→ on a handle change the width (Shift — a bigger step), not the question
+        got = self.page({"eval": f"document.querySelector('{SPLIT}').focus(), 1"}, {"key": "ArrowRight"}, {"eval": WID}, {"eval": COUNT},
+                        {"key": "ArrowLeft", "mods": ["shift"]}, {"eval": WID},
+                        {"eval": f"document.querySelector('{EDGE}').focus(), 1"}, {"key": "ArrowRight"}, {"eval": WID})
+        k1, k2, k3 = got[2]["eval"], got[5]["eval"], got[-1]["eval"]
+        self.assertEqual((k1["ctx"], k1["card"], k1["split"]["now"]), (e["ctx"] + 16, e["card"] - 16, e["ctx"] + 16))
+        self.assertEqual(got[3]["eval"], "1 из 2")
+        self.assertEqual((k2["ctx"], k2["card"]), (e["ctx"] - 48, e["card"] + 48))
+        self.assertEqual((k3["ctx"], k3["card"], k3["edge"]["now"]), (k2["ctx"], k2["card"] + 16, k2["card"] + 16))
+        self.assertEqual(k3["kept"], {"ctx": k3["ctx"], "card": k3["card"]})
+        # a narrower window: the pair fits it, neither gets under its least; wide again — the widths asked for come back
+        got = self.page({"eval": f"document.querySelector('{EDGE}').blur(), 1"}, self.shot("widths-narrow-window.png", width=1000),
+                        {"until": f"{WID}?.right <= innerWidth - 16 && {WID}.ctx < {k3['ctx']}", "ms": 3000}, {"eval": WID},
+                        self.shot("widths-wide-again.png"), {"until": f"{WID}?.ctx === {k3['ctx']} && {WID}.card === {k3['card']}", "ms": 3000})
+        n = got[3]["eval"]
+        self.assertGreaterEqual(n["left"], 16)
+        self.assertGreaterEqual(n["ctx"], 240)
+        self.assertGreaterEqual(n["card"], 400)
+        self.assertEqual(n["kept"], k3["kept"])                         # the fitting is not kept as the owner's choice
+        # a double click on a handle: the default widths, nothing kept
+        self.page({"eval": f"document.querySelector('{SPLIT}').dispatchEvent(new MouseEvent('dblclick', {{bubbles: true}})), 1"},
+                  {"until": f"{WID}?.ctx === 380 && {WID}.card === 680 && {WID}.kept === null", "ms": 3000})
+        # the card alone: no divider, its edge widens it
+        got = self.page({"eval": "document.querySelector('.ag-layer').focus(), 1"}, {"key": "ArrowRight"}, {"until": f"{COUNT} === '2 из 2'"},
+                        {"until": f"{WID}?.card === 680 && {WID}.ctx === null", "ms": 3000}, {"eval": WID},
+                        {"eval": f"document.querySelector('{EDGE}').focus(), 1"}, {"key": "ArrowRight"}, {"eval": WID})
+        self.assertIsNone(got[4]["eval"]["split"])
+        self.assertEqual((got[-1]["eval"]["card"], got[-1]["eval"]["kept"]), (696, {"ctx": 380, "card": 696}))
+        # the card leaves in the middle of a drag (here — a move to the other question): the drag ends, its widths are kept
+        got = self.page({"eval": "document.querySelector('.ag-layer').focus(), 1"}, {"key": "ArrowLeft"}, {"until": f"{COUNT} === '1 из 2'"},
+                        {"until": f"{WID}?.ctx === 380", "ms": 3000}, {"eval": WID})
+        s = got[-1]["eval"]
+        got = self.page({"eval": TO % (s["split"]["x"] + 60, s["split"]["y"])}, {"drag": SPLIT, "to": "#ag-to", "keep": True},
+                        {"eval": "document.body.classList.contains('resizing')"}, {"key": "ArrowRight"}, {"until": f"{COUNT} === '2 из 2'"},
+                        {"eval": "[document.body.classList.contains('resizing'), document.querySelectorAll('.ag-grip.dragging').length]"},
+                        {"drop": 1}, {"eval": WID})
+        self.assertTrue(got[2]["eval"])
+        self.assertEqual(got[5]["eval"], [False, 0])
+        kept = got[-1]["eval"]["kept"]
+        self.assertAlmostEqual(kept["ctx"], s["ctx"] + 60, delta=2)
+        self.assertEqual(kept["ctx"] + kept["card"], s["ctx"] + s["card"])
+        # a phone: the context above the card, no handles
+        got = self.page({"touch": True}, self.shot("widths-phone.png", width=390, height=780), {"key": "ArrowLeft"},
+                        {"until": f"{COUNT} === '1 из 2'"}, {"eval": WID})
+        p = got[-1]["eval"]
+        self.assertIsNone(p["split"])
+        self.assertIsNone(p["edge"])
+        self.assertLessEqual(p["right"], 390)

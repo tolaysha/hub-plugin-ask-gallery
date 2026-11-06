@@ -4,8 +4,9 @@
 // card (cards.js askCard): the answer goes the same /api/answer way with retries and a receipt, "close without an answer"
 // the same /api/question/dismiss; the plugin sends nothing of its own to the core and only reads the feed (/api/history).
 // It keeps only the open session's name for the tab's life (sessionStorage): the page reloads after a hub update, the mode
-// stays. The mode takes one history entry, so Back (the phone's back gesture) leaves it. With no open questions left it
-// goes back to the hub at once.
+// stays. In this browser it keeps the widths of the context and the card the owner dragged them to (localStorage). The mode
+// takes one history entry, so Back (the phone's back gesture) leaves it. With no open questions left it goes back to the
+// hub at once.
 import { askCard } from "/static/js/cards.js";
 import { avatarNode } from "/static/js/dom.js";
 import { S, sessionLabel } from "/static/js/state.js";
@@ -19,12 +20,16 @@ const WORDS = {
     of: (i, n) => `${i} из ${n}`, prev: "Предыдущий вопрос (←)", next: "Следующий вопрос (→)", nav: "Вопросы",
     label: (name) => `Вопросы сессии ${name}`, drop: "Убрать",
     context: "Контекст вопроса", loading: "Загружаю контекст…", failed: "Не удалось загрузить контекст", retry: "Повторить",
-    more: "ещё", less: "свернуть" },
+    more: "ещё", less: "свернуть",
+    split: "Ширина контекста и вопроса", edge: "Ширина вопроса",
+    gripHint: "Тяните или ←/→ — ширина; двойной клик — по умолчанию" },
   en: { open: "Questions only", openN: (n) => `Questions only: ${n} open`, exit: "Leave questions mode (Esc)",
     of: (i, n) => `${i} of ${n}`, prev: "Previous question (←)", next: "Next question (→)", nav: "Questions",
     label: (name) => `Questions of ${name}`, drop: "Remove",
     context: "Context of the question", loading: "Loading the context…", failed: "Could not load the context", retry: "Retry",
-    more: "more", less: "less" },
+    more: "more", less: "less",
+    split: "Width of the context and the question", edge: "Width of the question",
+    gripHint: "Drag or ←/→ — the width; double-click — back to default" },
 };
 const KEEP = "ask-gallery.open";   // sessionStorage: the session whose questions are open
 const MARK = "askGallery";         // the mode's own history entry (history.state[MARK] = the session)
@@ -32,11 +37,16 @@ const TICK = 250;                   // how often the open mode looks at the snap
 const SHIFT = 24;                   // percent of the card width it travels while sliding
 const PAGE = 200, PAGES = 10;       // the context: feed rows asked from /api/history at a time, and how far back at most (pages of a session)
 const POLL = 3000;                  // the context's rows: newer ones this often (the session's text after the card)
+const SIZE = "ask-gallery.widths";  // localStorage: { ctx, card } — the widths the owner dragged to, px
+const WIDE = { ctx: 380, card: 680 };       // the default widths
+const LEAST = { ctx: 240, card: 400 };      // narrower than this, neither is readable
 
 let hub, W;
 const cards = new Map();   // key -> { node: askCard form, slide, ctx: context box, asker, rid, frozen? } — typed text survives snapshots
 const feeds = new Map();   // session -> { rows: Map key -> row, more, loading, failed, pages, newest, polled } — the context's rows
-let m = null;              // the open mode: { name, items: [key], cur, slide, layer parts, timer, opener }
+let m = null;              // the open mode: { name, items: [key], cur, slide, layer parts, timer, opener, room, fit }
+let want = null;           // the widths asked for (dragged, or the default); shown as they fit the screen (fitted)
+let held = null;           // a handle being dragged: how to let it go (the card under it may leave meanwhile)
 
 const quiet = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
 const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -102,7 +112,13 @@ function open(name, opener) {
   if (history.state?.[MARK] !== name) history.pushState({ ...history.state, [MARK]: name }, "");   // a reload is already on it
   m = { name, items: [], cur: null, slide: null, opener: opener || null, ...build() };
   try { sessionStorage.setItem(KEEP, name); } catch { /* no storage */ }
+  want = stored();
   document.body.append(m.layer);
+  m.gap = ms("--space-6", 24);       // between the context and the card (ask-gallery.css)
+  m.width = roomOf(m.stage);
+  // the window or the stage's scrollbar: the widths fit the room again (measured here, not on every tick)
+  m.room = new ResizeObserver(([e]) => { m.width = e.contentRect.width; layout(); });
+  m.room.observe(m.stage);
   const app = document.getElementById("app");
   if (app) app.inert = true;   // Tab and screen readers stay inside the mode
   sync(true);
@@ -115,7 +131,9 @@ function open(name, opener) {
 function close(fromHistory = false) {
   if (!m) return;
   if (!fromHistory && history.state?.[MARK]) history.back();
+  held?.();
   clearInterval(m.timer);
+  m.room?.disconnect();
   m.layer.remove();
   m.slide?.remove();
   const app = document.getElementById("app");
@@ -153,7 +171,7 @@ function sync(first) {
   for (const w of all) {
     if (cards.has(w.key)) continue;
     const node = askCard(s, w.req), slide = hub.el("div", "ag-slide"), ctx = contextBox();
-    slide.append(ctx.box, node);
+    slide.append(ctx.box, grip("split"), node, grip("edge"));   // Tab goes as the eye does: the context, the divider, the card
     cards.set(w.key, { node, slide, ctx, asker: w.asker, rid: w.req.request_id, at: w.req.since ?? null, sig: null });
   }
   const frozen = [...cards].filter(([k, c]) => c.frozen && k.startsWith(m.name + ":") && !left(k)).map(([k]) => k);
@@ -187,6 +205,7 @@ function sync(first) {
   }
   for (const k of m.items) fill(cards.get(k));
   paint();
+  layout();
 }
 
 // the same tests as the page's feed (dock.js typed, ours)
@@ -254,10 +273,12 @@ function show(key, dir, answered, still = false) {
   const from = m.slide, to = key ? cards.get(key)?.slide || null : null;
   m.cur = key;
   m.slide = to;
+  layout();   // its handles' values at once, not on the next tick
   // a quick second move does not stack up. Only the slides' own moves, never an endless one: inside a card there may run
   // one (a theme's blinking caret, the dictation spinner), and finishing it throws — the move would stop halfway
   for (const s of m.stage.children) for (const a of s.getAnimations()) if (a.effect?.getComputedTiming().endTime !== Infinity) a.finish();
   if (from === to) return;
+  held?.();
   // the focus was on the leaving card, or already dropped to the page (cards.js blurs the card it sends from)
   const f = document.activeElement, lost = (!!from && from.contains(f)) || f === m.layer || !m.layer.contains(f);
   if (to) {
@@ -406,12 +427,127 @@ function fill(c) {
   fits(box, body, more);
 }
 
+// ---- the widths of the context and the card ----
+
+function stored() {
+  try {
+    const w = JSON.parse(localStorage.getItem(SIZE) || "null");
+    if (w && w.ctx > 0 && w.card > 0) return { ctx: +w.ctx, card: +w.card };
+  } catch { /* no storage, or not ours */ }
+  return { ...WIDE };
+}
+function keep() {
+  try { localStorage.setItem(SIZE, JSON.stringify(want)); } catch { /* no storage: for this time only */ }
+}
+function roomOf(stage) {
+  const cs = getComputedStyle(stage);
+  return stage.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+}
+
+// the widths asked for, as they fit the room: too wide — both narrow in the same proportion, neither under its least;
+// solo — the card with no context next to it
+function fitted(room) {
+  const g = m.gap;
+  let ctx = want.ctx, card = want.card;
+  if (ctx + g + card > room) { const k = (room - g) / (ctx + card); ctx *= k; card *= k; }
+  // whole pixels, never past the room: both halves rounded up would be a pixel too wide
+  ctx = Math.round(Math.max(LEAST.ctx, ctx));
+  card = Math.max(LEAST.card, Math.min(Math.round(card), Math.floor(room - g - ctx)));
+  ctx = Math.max(LEAST.ctx, Math.min(ctx, Math.floor(room - g - card)));   // the card at its least: the context gives way
+  return { ctx, card, solo: Math.max(LEAST.card, Math.min(Math.round(want.card), Math.floor(room))), room };
+}
+
+// the widths onto the open mode: the layer's CSS variables (ask-gallery.css), the shown handles' values
+function layout() {
+  if (!m) return;
+  const f = m.fit = fitted(m.width), sig = `${f.ctx}|${f.card}|${f.solo}`;
+  if (m.fitSig !== sig) {
+    m.fitSig = sig;
+    m.layer.style.setProperty("--ag-ctx-w", `${f.ctx}px`);
+    m.layer.style.setProperty("--ag-card-w", `${f.card}px`);
+    m.layer.style.setProperty("--ag-solo-w", `${f.solo}px`);
+  }
+  const s = m.slide, pair = !!s?.classList.contains("with-ctx");
+  if (!s) return;
+  value(s.querySelector(".ag-split"), f.ctx, LEAST.ctx, f.ctx + f.card - LEAST.card);
+  value(s.querySelector(".ag-edge"), pair ? f.card : f.solo, LEAST.card, pair ? f.room - m.gap - f.ctx : f.room);
+}
+function value(h, now, min, max) {
+  for (const [k, v] of [["aria-valuenow", now], ["aria-valuemin", min], ["aria-valuemax", Math.round(Math.max(min, max))]])
+    if (h.getAttribute(k) !== String(v)) h.setAttribute(k, v);
+}
+
+// from the widths shown (f), by d px: split — the context takes it from the card, the pair keeps its width; edge — the
+// card, the pair stays in the middle. What is shown becomes what is asked for: a move in a narrow window sets the widths
+function resize(kind, f, pair, d) {
+  const room = Math.floor(m.width);   // now, not when the drag began: a scrollbar may have come meanwhile
+  d = Math.round(d);   // whole pixels: the pair's width stays the sum of its parts
+  if (kind === "split") {
+    const both = f.ctx + f.card, ctx = Math.max(LEAST.ctx, Math.min(f.ctx + d, both - LEAST.card));
+    want = { ctx, card: both - ctx };
+  } else if (pair) want = { ctx: f.ctx, card: Math.max(LEAST.card, Math.min(f.card + d, room - m.gap - f.ctx)) };
+  else want = { ...want, card: Math.max(LEAST.card, Math.min(f.solo + d, room)) };
+  layout();
+}
+
+// a width handle as the page's own divider (base.css .grip: its look, cursor and the theme's colors), dragged by a mouse or
+// a finger, ←/→ (Shift — a bigger step) on the keyboard, a double click — the default widths. split — between the context
+// and the card; edge — the card's outer edge: the pair is centered, so it grows by twice the move
+function grip(kind) {
+  const h = hub.el("div", `grip ag-grip ag-${kind}`);
+  h.setAttribute("role", "separator");
+  h.setAttribute("aria-orientation", "vertical");
+  h.setAttribute("aria-label", kind === "split" ? W.split : W.edge);
+  h.title = W.gripHint;
+  h.tabIndex = 0;
+  const pair = () => h.parentNode.classList.contains("with-ctx");
+  let drag = null;
+  const end = () => {
+    if (held === end) held = null;
+    if (!drag) return;
+    const moved = drag.moved;
+    drag = null;
+    h.classList.remove("dragging");
+    document.body.classList.remove("resizing");   // the page's own: the col-resize cursor everywhere, no text selected
+    if (moved) keep();
+  };
+  h.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0 || !m?.fit) return;
+    e.preventDefault();
+    h.setPointerCapture(e.pointerId);
+    drag = { x: e.clientX, f: m.fit, pair: pair(), moved: false };
+    held = end;
+    h.classList.add("dragging");
+    document.body.classList.add("resizing");
+  });
+  h.addEventListener("pointermove", (e) => {
+    if (!drag || (!drag.moved && Math.abs(e.clientX - drag.x) <= 3)) return;   // a click with a shaky hand keeps the widths
+    drag.moved = true;
+    resize(kind, drag.f, drag.pair, (e.clientX - drag.x) * (kind === "edge" ? 2 : 1));
+  });
+  h.addEventListener("pointerup", end);
+  h.addEventListener("lostpointercapture", end);
+  h.addEventListener("keydown", (e) => {
+    const dir = { ArrowLeft: -1, ArrowRight: 1 }[e.key];
+    if (!dir || !m?.fit) return;
+    e.preventDefault();
+    resize(kind, m.fit, pair(), dir * (e.shiftKey ? 64 : 16));
+    keep();
+  });
+  h.addEventListener("dblclick", () => {
+    want = { ...WIDE };
+    try { localStorage.removeItem(SIZE); } catch { /* no storage */ }
+    layout();
+  });
+  return h;
+}
+
 // a finger swipe across the card: left — the next question, right — the previous one; a vertical one scrolls
 function swipe(stage) {
   let x0 = null, y0 = 0;
   stage.addEventListener("touchstart", (e) => {
     const t = e.touches[0];
-    x0 = e.touches.length === 1 && !e.target.closest("textarea, input[type=text], pre, .code, .ag-ctx") ? t.clientX : null;
+    x0 = e.touches.length === 1 && !e.target.closest("textarea, input[type=text], pre, .code, .ag-ctx, .ag-grip") ? t.clientX : null;
     y0 = t.clientY;
   }, { passive: true });
   stage.addEventListener("touchend", (e) => {
@@ -422,10 +558,11 @@ function swipe(stage) {
   }, { passive: true });
 }
 
-// a field that uses ←/→ itself (a checkbox does not); a control that Space presses
+// a field that uses ←/→ itself (a checkbox does not); a control that Space presses (a width handle is not one: Space on it
+// must not reach the page's voice message)
 const typing = (n) => (/^(INPUT|TEXTAREA|SELECT)$/.test(n?.tagName || "") && n.type !== "checkbox") || !!n?.isContentEditable;
-const pressable = (n) => typing(n) || /^(INPUT|BUTTON)$/.test(n?.tagName || "")
-  || !!n?.matches?.('[role=button], [tabindex]:not([tabindex="-1"])');
+const pressable = (n) => (typing(n) || /^(INPUT|BUTTON)$/.test(n?.tagName || "")
+  || !!n?.matches?.('[role=button], [tabindex]:not([tabindex="-1"])')) && !n.classList.contains("ag-grip");
 
 // keys of the mode go before the page's: Esc leaves the mode (the page's Esc would close the question without an
 // answer), ←/→ move between questions, Space outside a field does not start a voice message to the session
@@ -438,7 +575,8 @@ function keys(e) {
     e.preventDefault();
     e.stopImmediatePropagation();
     close();
-  } else if ((e.key === "ArrowLeft" || e.key === "ArrowRight") && !typing(document.activeElement)) {
+  } else if ((e.key === "ArrowLeft" || e.key === "ArrowRight") && !typing(document.activeElement)
+    && !document.activeElement?.classList.contains("ag-grip")) {   // a width handle: its own arrows
     e.preventDefault();
     e.stopImmediatePropagation();
     step(e.key === "ArrowRight" ? 1 : -1, true);

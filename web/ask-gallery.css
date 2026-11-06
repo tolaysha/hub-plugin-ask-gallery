@@ -31,7 +31,20 @@
 .ag-ctx-more { justify-self: start; }
 .ag-ctx-more[hidden] { display: none; }
 @media (min-width: 961px) { .ag-ctx-more { display: none; } }
+/* the widths (main.js layout): the owner's, as they fit the room; the handles are the page's divider (base.css .grip) — in the
+   gap between the context and the card, and just outside the card's edge. A narrow screen: the default widths, no handles */
+@media (min-width: 961px) {
+  .ag-slide { position: relative; width: var(--ag-solo-w, min(680px, 100%)); }
+  .ag-slide.with-ctx { width: calc(var(--ag-ctx-w, 380px) + var(--space-6) + var(--ag-card-w, 680px));
+    grid-template-columns: var(--ag-ctx-w, 380px) var(--ag-card-w, 680px); }
+}
+/* the geometry is the plugin's own (the page's .grip gives the look): a renamed core class must not drop the handles into the grid */
+.ag-grip { position: absolute; top: 0; bottom: 0; z-index: var(--z-grip); width: 9px; cursor: col-resize; touch-action: none; outline: 0; }
+.ag-split { left: calc(var(--ag-ctx-w, 380px) + var(--space-6) / 2 - 4.5px); }
+.ag-edge { right: calc(var(--space-2) * -1 - 4.5px); }
+.ag-slide:not(.with-ctx) > .ag-split { display: none; }
 @media (max-width: 960px) {
+  .ag-grip { display: none; }
   .ag-slide.with-ctx { width: min(680px, 100%); grid-template-columns: minmax(0, 1fr); gap: var(--space-3); }
   .ag-ctx { position: static; }
   .ag-ctx-body { max-height: 5.6em; overflow: hidden; }   /* about four lines, "more" opens the rest */
