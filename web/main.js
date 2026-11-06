@@ -6,7 +6,7 @@
 // It keeps only the open session's name for the tab's life (sessionStorage): the page reloads after a hub update, the mode
 // stays. In this browser it keeps the widths of the context and the card the owner dragged them to (localStorage). The mode
 // takes one history entry, so Back (the phone's back gesture) leaves it. With no open questions left it goes back to the
-// hub at once.
+// hub as soon as the last answered card has flown up.
 import { askCard } from "/static/js/cards.js";
 import { avatarNode } from "/static/js/dom.js";
 import { S, sessionLabel } from "/static/js/state.js";
@@ -34,7 +34,10 @@ const WORDS = {
 const KEEP = "ask-gallery.open";   // sessionStorage: the session whose questions are open
 const MARK = "askGallery";         // the mode's own history entry (history.state[MARK] = the session)
 const TICK = 250;                   // how often the open mode looks at the snapshot and at the shown card
-const SHIFT = 24;                   // percent of the card width it travels while sliding
+// a move between questions is a photo gallery's: both slides travel the stage's whole width together, quick off the mark
+// and slowing to a soft stop; an answered one flies up out of the stage in the same time
+const SLIDE = 420;
+const EASE = "cubic-bezier(.22, .61, .36, 1)";
 const PAGE = 200, PAGES = 10;       // the context: feed rows asked from /api/history at a time, and how far back at most (pages of a session)
 const POLL = 3000;                  // the context's rows: newer ones this often (the session's text after the card)
 const SIZE = "ask-gallery.widths";  // localStorage: { ctx, card } — the widths the owner dragged to, px
@@ -76,8 +79,11 @@ function asks(s) {
   return [...own, ...shown];
 }
 
-// the card has left on our side: the core took the answer (got) or the question was closed without one (hidden)
-const left = (key) => { const c = cards.get(key)?.node; return !!c && (!!c.dataset.got || c.hidden || !!c.dataset.agClosed); };
+// the card is done on our side: the core took the answer (got) or the question was closed without one (hidden)
+const done = (c) => !!c.dataset.got || c.hidden || !!c.dataset.agClosed;
+// it has left: done, or its answer is on its way (cards.js deliver: sending; a refusal takes the mark off and the card is
+// back in the list). A frozen one stays: its question was closed elsewhere while the answer was on its way, the text is kept
+const left = (key) => { const c = cards.get(key)?.node; return !!c && (done(c) || (!!c.dataset.sending && !c.dataset.frozen)); };
 
 function build() {
   const layer = hub.el("div", "ag-layer");
@@ -119,6 +125,10 @@ function open(name, opener) {
   // the window or the stage's scrollbar: the widths fit the room again (measured here, not on every tick)
   m.room = new ResizeObserver(([e]) => { m.width = e.contentRect.width; layout(); });
   m.room.observe(m.stage);
+  // an answer leaves the moment it is given, not on the next tick: in the same click cards.js marks the card sending and
+  // folds it into a receipt line, which must never be painted here
+  m.sent = new MutationObserver(() => sync(false));
+  m.sent.observe(m.stage, { subtree: true, attributeFilter: ["data-sending"] });
   const app = document.getElementById("app");
   if (app) app.inert = true;   // Tab and screen readers stay inside the mode
   sync(true);
@@ -134,6 +144,7 @@ function close(fromHistory = false) {
   held?.();
   clearInterval(m.timer);
   m.room?.disconnect();
+  m.sent?.disconnect();
   m.layer.remove();
   m.slide?.remove();
   const app = document.getElementById("app");
@@ -156,15 +167,18 @@ function sync(first) {
   const all = s ? asks(s) : [], open = new Set(all.map((w) => w.key));
   // a card stays cached while its question is in the snapshot: typed text survives, and an answered one is not
   // made again while the snapshot still lags behind the answer
+  let back = null;   // a card whose answer the core refused: it is in the list again, with the reason
   for (const [k, c] of [...cards]) {
     if (!k.startsWith(m.name + ":")) continue;
+    if (c.node.dataset.sending) c.flew = true;
+    else if (c.flew) { c.flew = false; back = k; }
     if (!c.node.dataset.got && ours(c.node)) {
       c.node.dataset.got = "1";   // the core recorded our own answer: it leaves, never frozen
     }
     if (open.has(k)) { if (c.frozen) cards.delete(k); continue; }   // the same question open again: a live card
     // closed elsewhere (another device, Telegram) while the owner was typing here: the card stays, frozen, with the
     // text — as the page's feed does (dock.js)
-    if (!c.frozen && !left(k) && !c.node.dataset.closing && (typed(c.node) || dictationIn(c.node))) freeze(c);
+    if (!c.frozen && !done(c.node) && !c.node.dataset.closing && (typed(c.node) || dictationIn(c.node))) freeze(c);
     else if (!c.frozen || left(k)) cards.delete(k);
   }
   prune();
@@ -188,22 +202,36 @@ function sync(first) {
   if (m.say.textContent !== say) { m.say.textContent = say; m.say.hidden = !say; }
   const before = m.items;
   m.items = [...before.filter((k) => keep.has(k)), ...live.filter((k) => !before.includes(k))];
-  // nothing left to answer: back to the hub at once, as by Esc — without waiting for the session to take the answer.
-  // A frozen card counts as a question: the owner's typed or dictated text holds the mode
-  if (!m.items.length) return void close();
+  // nothing left to answer: back to the hub as by Esc once the last card has flown up — without waiting for the session to
+  // take the answer. A frozen card counts as a question: the owner's typed or dictated text holds the mode
+  if (!m.items.length) {
+    if (m.end) return;
+    const was = m, gone = show(null, 1, true);
+    if (!gone) return void close();
+    m.end = setTimeout(() => { if (m === was && !m.items.length) close(); }, gone);
+    return;
+  }
+  if (m.end) { clearTimeout(m.end); m.end = null; }   // a new question came while the last card was flying up: the mode stays
   if (first) show(m.items[0], 1, false, true);
   else if (!keep.has(m.cur)) {
     // the shown question is answered or closed: it leaves, the one after it comes (the one before it, if it was the last)
     const was = before.indexOf(m.cur);
     const after = before.slice(was + 1).find((k) => keep.has(k));
     const prior = before.slice(0, was).reverse().find((k) => keep.has(k));
-    show(after || prior || m.items[0], after ? 1 : -1, true);   // or one that came on the same tick
+    show(after || prior || m.items[0], after || !prior ? 1 : -1, true);   // or one that came meanwhile: at the end, from the right
   } else if (cards.get(m.cur)?.slide !== m.slide) {
     const k = m.cur;   // the same question was asked again: its live card takes the frozen one's place
     m.cur = null;
     show(k, 1, false, true);
+  } else if (back && m.items.includes(back) && back !== m.cur) {
+    // it flew away before the refusal came: back on screen with the reason, unless the owner is typing in another card —
+    // then the reason goes to the header's line and the card waits in the list
+    const here = cards.get(m.cur).node, why = cards.get(back).node.querySelector(".error-text")?.textContent;
+    if (!((typed(here) || dictationIn(here)) && why && hub.banner(why))) show(back, Math.sign(m.items.indexOf(back) - m.items.indexOf(m.cur)), false);
   }
   for (const k of m.items) fill(cards.get(k));
+  // a slide whose move is over is gone by its finish event; should the event not come, the next tick takes it away
+  for (const x of [...m.stage.children]) if (x !== m.slide && !x.getAnimations().length) x.remove();
   paint();
   layout();
 }
@@ -251,22 +279,26 @@ function freeze(c) {
 
 function paint() {
   const n = m.items.length, at = Math.max(m.items.indexOf(m.cur), 0), of = W.of(at + 1, n);
+  if (!n) return;   // the last card is flying up: its count stays until the mode closes
   if (m.count.textContent !== of) m.count.textContent = of;   // a live region: rewritten only when it changes
   m.prev.disabled = at <= 0;
   m.next.disabled = at >= n - 1;
 }
 
-// keys: a plain swap (motion on a keyboard shortcut only delays the next press); buttons and a swipe slide
-function step(d, byKey = false) {
+// keys, buttons and a swipe slide alike: a quick next press finishes the move under way (show), it does not wait for it
+function step(d) {
   if (!m) return;
   const at = m.items.indexOf(m.cur) + d;
   if (at < 0 || at >= m.items.length) return;
-  show(m.items[at], d, false, byKey);
+  show(m.items[at], d, false);
   paint();
 }
 
-// one card on screen: the old one slides out, the new one slides in from the side of the move; an answered card goes
-// up and fades. With reduced motion nothing moves: a move is a plain swap, an answer is a fade
+// one card on screen. A move: the old slide and the new one travel side by side, the old one out over the edge it moves
+// toward, the new one in from the other — the stage's width, so neither is ever half seen; nothing fades on the way. An
+// answer: the answered slide flies up out of the stage, fading at the end, as the next one comes in sideways (from the
+// right, or from the left when it was the last in the list). With reduced motion nothing moves: a move is a plain swap,
+// an answer is a fade. Returns how long the old slide takes to leave, ms (0: it is gone at once, or there was none)
 function show(key, dir, answered, still = false) {
   // the shown slide is held by the mode, not looked up in the cache: the snapshot may drop the answered question
   // (and its cache entry) before the answer's receipt comes back
@@ -274,10 +306,14 @@ function show(key, dir, answered, still = false) {
   m.cur = key;
   m.slide = to;
   layout();   // its handles' values at once, not on the next tick
-  // a quick second move does not stack up. Only the slides' own moves, never an endless one: inside a card there may run
-  // one (a theme's blinking caret, the dictation spinner), and finishing it throws — the move would stop halfway
-  for (const s of m.stage.children) for (const a of s.getAnimations()) if (a.effect?.getComputedTiming().endTime !== Infinity) a.finish();
-  if (from === to) return;
+  // a quick second move does not stack up: the one under way ends now, a slide still leaving goes at once. Only the slides'
+  // own moves, never an endless one: inside a card there may run one (a theme's blinking caret, the dictation spinner),
+  // and finishing it throws — the move would stop halfway
+  for (const s of [...m.stage.children]) {
+    for (const a of s.getAnimations()) if (a.effect?.getComputedTiming().endTime !== Infinity) a.finish();
+    if (s !== from && s !== to) s.remove();
+  }
+  if (from === to) return 0;
   held?.();
   // the focus was on the leaving card, or already dropped to the page (cards.js blurs the card it sends from)
   const f = document.activeElement, lost = (!!from && from.contains(f)) || f === m.layer || !m.layer.contains(f);
@@ -289,20 +325,25 @@ function show(key, dir, answered, still = false) {
   if (lost) m.layer.focus({ preventScroll: true });   // ←/→ keep working
   const calm = quiet(), fade = calm && answered;
   still ||= calm && !answered;
-  const ease = css("--ease-out") || "ease-out", out = ms("--dur-fast", 160), inn = ms("--dur", 240);
+  const ease = css("--ease-out") || "ease-out", out = ms("--dur-fast", 160), wide = m.stage.clientWidth;
   if (to && !still) to.animate(fade ? [{ opacity: 0 }, { opacity: 1 }]
-    : [{ opacity: 0, transform: `translateX(${dir * SHIFT}%)` }, { opacity: 1, transform: "none" }],
-    { duration: fade ? out : inn, easing: ease, delay: answered && from ? out / 2 : 0, fill: "backwards" });
-  if (!from) return;
+    : [{ transform: `translateX(${dir * wide}px)` }, { transform: "none" }],
+    fade ? { duration: out, easing: ease, delay: from ? out / 2 : 0, fill: "backwards" } : { duration: SLIDE, easing: EASE });
+  if (!from) return 0;
   from.inert = true;
   const card = from.querySelector(":scope > .card");
   if (card.hidden) { card.dataset.agClosed = "1"; card.hidden = false; }   // closed without an answer: it leaves visibly too
-  if (still) return void from.remove();
+  // the answer just given: in this same task, before any paint, cards.js has folded the card into its receipt line ("Your
+  // answer: … — sending"). It leaves as the owner saw it when answering (a failed answer comes back whole: left)
+  if (card.dataset.sending) { card.classList.remove("sent"); card.querySelector(".sent-line")?.remove(); }
+  if (still) { from.remove(); return 0; }
+  const rise = from.getBoundingClientRect().bottom - m.stage.getBoundingClientRect().top;   // its bottom edge past the stage's top
   const gone = fade ? [{ opacity: 1 }, { opacity: 0 }] : answered
-    ? [{ opacity: 1, transform: "none" }, { opacity: 0, transform: "translateY(-12%) scale(0.96)" }]
-    : [{ opacity: 1, transform: "none" }, { opacity: 0, transform: `translateX(${-dir * SHIFT}%)` }];
-  const a = from.animate(gone, { duration: answered && !fade ? inn : out, easing: ease });
+    ? [{ transform: "none", opacity: 1 }, { opacity: 1, offset: 0.6 }, { transform: `translateY(${-rise}px)`, opacity: 0 }]
+    : [{ transform: "none" }, { transform: `translateX(${-dir * wide}px)` }];
+  const time = fade ? out : SLIDE, a = from.animate(gone, { duration: time, easing: fade ? ease : EASE });
   a.onfinish = a.oncancel = () => { if (m?.slide !== from) from.remove(); };
+  return time;
 }
 
 // ---- the context of a question ----
@@ -579,7 +620,7 @@ function keys(e) {
     && !document.activeElement?.classList.contains("ag-grip")) {   // a width handle: its own arrows
     e.preventDefault();
     e.stopImmediatePropagation();
-    step(e.key === "ArrowRight" ? 1 : -1, true);
+    step(e.key === "ArrowRight" ? 1 : -1);
   } else if (e.code === "Space" && !pressable(document.activeElement)) {
     e.stopImmediatePropagation();
   }
@@ -589,7 +630,7 @@ function keys(e) {
 // glyph of a session row waiting for you (sidebar.js, "?") in the same color, the button edged with it; the number is
 // in its label. The root is per session, so is the button
 function headButton(root, snap, ctx) {
-  const s = ctx.session, n = asks(s).length;
+  const s = ctx.session, n = asks(s).filter((w) => !left(w.key)).length;   // an answer already on its way is not counted
   let b = root.firstChild;
   if (!b) {
     b = hub.el("button", "btn small ag-open");
@@ -597,7 +638,8 @@ function headButton(root, snap, ctx) {
     const g = hub.el("span", "glyph ag-q", "?");
     g.setAttribute("aria-hidden", "true");
     b.append(g, hub.el("span", "ag-t", W.open));
-    b.addEventListener("click", () => open(s.name, b));
+    const name = s.name, now = () => (hub.snapshot()?.sessions || []).find((x) => x.name === name);
+    b.addEventListener("click", () => { if (asks(now() || {}).some((w) => !left(w.key))) open(name, b); });
     root.append(b);
   }
   b.hidden = !n;

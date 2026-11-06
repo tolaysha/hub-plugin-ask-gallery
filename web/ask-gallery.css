@@ -17,6 +17,8 @@
 .ag-stage { grid-area: 2 / 1; display: grid; overflow: auto; overflow-x: hidden; padding: var(--space-6) var(--space-4); }
 .ag-slide { grid-area: 1 / 1; width: min(680px, 100%); margin: auto; }
 .ag-slide > .card { margin: 0; box-shadow: var(--shadow-lift); }
+/* an answered card flies away showing what was picked (a single choice has no circle: the row keeps its hover tint) */
+.ag-slide[inert] > .card .opt.pick:has(input:checked) { background: var(--accent); }
 /* the context (main.js contextBox, chain.js): left of the card, its own scroll; a narrow screen — above the card, folded */
 .ag-slide.with-ctx { width: min(1100px, 100%); display: grid; grid-template-columns: minmax(0, 380px) minmax(0, 680px);
   gap: var(--space-6); align-items: start; justify-content: center; }

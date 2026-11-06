@@ -1,8 +1,8 @@
 {
   "name": "ask-gallery",
   "description": "A \"Questions only\" mode for a session: its open questions full screen, one at a time, and next to each the session's text nearest to it, with your earlier answer when that answer started its turn",
-  "why": "Go through a session's questions in a row, knowing what each one is about: answer, and the next card slides in; no questions left, and you are back in the hub",
-  "version": "1.3.3",
+  "why": "Go through a session's questions in a row, knowing what each one is about: answer, and the card flies up as the next one slides in; no questions left, and you are back in the hub",
+  "version": "1.4.0",
   "hub": "^1.32",
   "web": "web/main.js",
   "icon": "web/icons/ask.svg"

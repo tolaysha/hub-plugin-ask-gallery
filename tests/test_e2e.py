@@ -10,6 +10,7 @@ import sys
 sys.path.insert(0, os.getcwd())   # the hub repo: tests/ and core/ come from there
 import tests  # noqa: E402,F401 — drops the machine's own HUB_* settings
 import json  # noqa: E402
+import time  # noqa: E402
 from unittest import mock  # noqa: E402
 
 from tests import test_web_e2e as e2e  # noqa: E402
@@ -50,6 +51,7 @@ OPEN = ".slot-session-header .ag-open:not([hidden])"
 LAYER = ".ag-layer"
 COUNT = "document.querySelector('.ag-layer .ag-count')?.textContent"
 CUR = "document.querySelector('.ag-layer .ag-slide:not([inert]) legend')?.textContent"
+ONE = "document.querySelectorAll('.ag-layer .ag-slide').length === 1"   # the move is over: only the shown slide is left
 
 
 def load_tests(loader, standard, pattern):   # only this file's tests, not the inherited page suite
@@ -96,6 +98,13 @@ class Gallery(e2e.PageInChrome):
                          {"eval": f"document.querySelector('{OPEN}').click(), 1"},
                          {"until": f"!!document.querySelector('{LAYER} .ag-slide')"}, *more)
 
+    def taken(self, *rids):
+        end = time.time() + 8   # the card leaves at once, the core records the answer a moment later
+        while any(r in self.pending() for r in rids) and time.time() < end:
+            time.sleep(0.05)
+        for r in rids:
+            self.assertNotIn(r, self.pending())
+
     def pending(self):
         from core import journal, reducer   # the core's own fold of the test journal
         st = reducer.fold(reducer.empty(), journal.read(self.j.path))
@@ -131,14 +140,14 @@ class Gallery(e2e.PageInChrome):
                         {"until": "document.querySelectorAll('.ag-layer .ag-slide').length === 1"})
         self.assertIn("Какие проверки", got[5]["eval"])
         self.assertTrue(got[-1]["until"])                               # the answered card is gone from the stage
-        self.assertNotIn("r1", self.pending())                          # the core took the answer
+        self.taken("r1")                                                # the core took the answer
         # several options and "Answer"; then a question arrives while the mode is open — it joins the end
         got = self.page({"eval": "(() => { const s = document.querySelector('.ag-layer .ag-slide:not([inert])');"
                                  " const b = s.querySelectorAll('input[type=checkbox]'); b[0].click(); b[2].click();"
                                  " s.querySelector('button[type=submit]').click(); return 1; })()"},
                         {"until": f"{COUNT} === '1 из 1'", "ms": 8000})
         self.assertTrue(got[-1]["until"])
-        self.assertNotIn("r2", self.pending())
+        self.taken("r2")
         self.ask("r4", "Переносим окно работ на субботу?")
         got = self.page({"until": f"{COUNT} === '1 из 2'", "ms": 8000}, {"eval": CUR})
         self.assertIn("Как назовём", got[-1]["eval"])                   # the shown card stays; the new one is second
@@ -151,7 +160,7 @@ class Gallery(e2e.PageInChrome):
                         {"eval": "[document.getElementById('app').inert, document.activeElement?.id]"})
         self.assertIn("Переносим окно", got[4]["eval"])
         self.assertEqual(got[-1]["eval"], [False, "msg"])               # back in the hub: the session's field
-        self.assertEqual(self.pending(), [])
+        self.taken("r3", "r4")
         # the session asks again: the mode opens on it; Esc leaves the mode and does not close the question
         self.page({"until": f"!document.querySelector('{OPEN}')", "ms": 8000})   # the core took the closing: no button
         self.ask("r5", "Включаем новый кэш для всех?")
@@ -192,17 +201,188 @@ class Gallery(e2e.PageInChrome):
         self.assertEqual(got[-1]["eval"], 0)
         # an answer still shows that the card left — by fading, without movement
         got = self.page({"eval": "window.__moves = [], document.querySelector('.ag-layer .ag-slide:not([inert]) label.opt').click(), 1"},
-                        {"until": f"{COUNT} === '1 из 1'", "ms": 8000}, {"eval": "window.__moves"})
-        self.assertEqual(got[-1]["eval"], [False, False])
+                        {"until": f"{COUNT} === '1 из 1'", "ms": 8000}, {"eval": "window.__moves"},
+                        {"eval": "window.__moves = [], document.querySelector('.ag-layer .ag-slide:not([inert]) label.opt').click(), 1"},
+                        {"until": f"!document.querySelector('{LAYER}')", "ms": 8000}, {"eval": "window.__moves"})
+        self.assertEqual(got[2]["eval"], [False, False])
+        self.assertEqual(got[-1]["eval"], [False])                       # the last one fades, then the mode closes
 
-    def test_keys_swap_cards_at_once_and_buttons_slide(self):
+    # the slides' own moves stopped at half time: where each slide is (its transform), how long its move is, its opacity
+    MID = ("(() => { const out = []; for (const s of document.querySelectorAll('.ag-layer .ag-stage > .ag-slide')) {"
+           " const as = s.getAnimations().filter((a) => a.effect.getComputedTiming().endTime !== Infinity);"
+           " for (const a of as) { a.pause(); a.currentTime = a.effect.getComputedTiming().duration / 2; }"
+           " const t = new DOMMatrix(getComputedStyle(s).transform);"
+           " out.push({leaving: s.inert, n: as.length, ms: as.map((a) => a.effect.getComputedTiming().duration),"
+           " delay: as.map((a) => a.effect.getComputedTiming().delay), x: Math.round(t.e), y: Math.round(t.f),"
+           " op: +getComputedStyle(s).opacity, wide: document.querySelector('.ag-layer .ag-stage').clientWidth}); }"
+           " return out; })()")
+    PLAY = "document.querySelectorAll('.ag-layer .ag-slide').forEach((s) => s.getAnimations().forEach((a) => a.play())), 1"
+    # the most slides the stage ever held at once
+    MOST = ("(() => { const st = document.querySelector('.ag-layer .ag-stage'); let n = st.children.length; window.__most = n;"
+            " new MutationObserver((rs) => { for (const r of rs) { n += r.addedNodes.length - r.removedNodes.length;"
+            " window.__most = Math.max(window.__most, n); } }).observe(st, {childList: true}); return 1; })()")
+
+    def mid(self, got):
+        out, inn = [x for x in got if x["leaving"]], [x for x in got if not x["leaving"]]
+        self.assertEqual((len(out), len(inn)), (1, 1), got)
+        return out[0], inn[0]
+
+    def test_a_move_slides_both_cards_across_the_stage_together_like_a_photo_gallery(self):
+        for n, q in enumerate(("Первый?", "Второй?", "Третий?", "Четвёртый?", "Пятый?"), 1):
+            self.ask(f"r{n}", q)
+        got = self.opened({"eval": self.MOST}, {"key": "ArrowRight"}, {"eval": self.MID},
+                          self.shot("move-mid-light.png", theme="light"), self.shot("move-mid-dark.png", theme="dark"),
+                          {"eval": self.PLAY}, {"until": f"{COUNT} === '2 из 5' && {ONE}"},
+                          {"eval": "document.querySelector('.ag-prev').click(), 1"}, {"eval": self.MID}, {"eval": self.PLAY},
+                          {"until": f"{COUNT} === '1 из 5' && {ONE}"})
+        out, inn = self.mid(got[6]["eval"])
+        # → : the shown one goes out to the left, the next one comes in from the right, both at once and all the way
+        self.assertLess(out["x"], -100)
+        self.assertGreater(inn["x"], 100)
+        self.assertEqual(inn["x"] - out["x"], out["wide"])               # one strip: always the stage's width apart
+        self.assertEqual((out["y"], inn["y"], out["op"], inn["op"]), (0, 0, 1, 1))   # sideways only, no fading on the way
+        for x in (out, inn):
+            self.assertEqual(x["n"], 1)
+            self.assertGreaterEqual(x["ms"][0], 380)
+            self.assertLessEqual(x["ms"][0], 500)
+            self.assertEqual(x["delay"], [0])                             # they start together
+        out, inn = self.mid(got[12]["eval"])                             # the "previous" button: the other way
+        self.assertGreater(out["x"], 100)
+        self.assertLess(inn["x"], -100)
+        # quick presses and a held key: each press finishes the move under way, the order holds, nothing stacks up
+        hold = ("(() => { for (let i = 0; i < 12; i++) window.dispatchEvent(new KeyboardEvent('keydown',"
+                " {key: 'ArrowRight', code: 'ArrowRight', repeat: i > 0, bubbles: true, cancelable: true})); return 1; })()")
+        got = self.page({"key": "ArrowRight"}, {"key": "ArrowRight"}, {"until": f"{COUNT} === '3 из 5' && {ONE}"},
+                        {"until": f"{CUR}?.includes('Третий?')"}, {"eval": hold},
+                        {"until": f"{COUNT} === '5 из 5' && {ONE}"}, {"until": f"{CUR}?.includes('Пятый?')"},
+                        {"eval": "window.__most"})
+        self.assertLessEqual(got[-1]["eval"], 2)
+
+    def test_an_answered_card_flies_up_and_the_next_comes_in_sideways(self):
         self.ask("r1", "Первый?")
         self.ask("r2", "Второй?")
-        got = self.opened({"eval": "window.__n = () => document.querySelector('.ag-stage').getAnimations({subtree: true}).length, 1"},
-                          {"key": "ArrowRight"}, {"until": f"{COUNT} === '2 из 2'"}, {"eval": "window.__n()"},
-                          {"eval": "document.querySelector('.ag-prev').click(), window.__n()"})
-        self.assertEqual(got[-2]["eval"], 0)
-        self.assertEqual(got[-1]["eval"], 2)
+        self.ask("r3", "Третий?")
+        pick = "document.querySelector('.ag-layer .ag-slide:not([inert]) label.opt').click(), 1"
+        got = self.opened({"eval": pick}, {"eval": self.MID},
+                          self.shot("answer-mid-light.png", theme="light"), self.shot("answer-mid-dark.png", theme="dark"),
+                          {"eval": self.PLAY}, {"until": f"{COUNT} === '1 из 2' && {ONE}", "ms": 8000},
+                          {"until": f"{CUR}?.includes('Второй?')"})
+        out, inn = self.mid(got[5]["eval"])
+        self.assertEqual(out["x"], 0)
+        self.assertLess(out["y"], -50)                                   # the answered one goes up
+        self.assertGreater(inn["x"], 100)                                # the next one comes from the right
+        self.assertEqual(inn["op"], 1)
+        self.assertGreaterEqual(min(out["ms"] + inn["ms"]), 380)
+        # the last in the list answered: the one before it comes from the left
+        got = self.page({"key": "ArrowRight"}, {"until": f"{COUNT} === '2 из 2' && {ONE}"}, {"eval": pick}, {"eval": self.MID},
+                        {"eval": self.PLAY}, {"until": f"{COUNT} === '1 из 1' && {ONE}", "ms": 8000}, {"until": f"{CUR}?.includes('Второй?')"})
+        out, inn = self.mid(got[3]["eval"])
+        self.assertLess(out["y"], -50)
+        self.assertLess(inn["x"], -100)
+        # the last answer: it flies up, and the mode closes once it is gone, not before and not much later
+        gone = ("window.__gone = null, new MutationObserver(() => { if (window.__gone == null && !document.querySelector('.ag-layer'))"
+                " window.__gone = performance.now(); }).observe(document.body, {childList: true}), 1")
+        flying = ("(() => { const s = document.querySelector('.ag-layer .ag-slide[inert]'); const a = s?.getAnimations()[0];"
+                  " return a ? {up: JSON.stringify(a.effect.getKeyframes()).includes('translateY(-'), ms: a.effect.getComputedTiming().duration} : null; })()")
+        got = self.page({"eval": gone}, {"eval": "window.__click = performance.now(), " + pick}, {"eval": flying},
+                        {"until": f"!document.querySelector('{LAYER}')", "ms": 8000}, {"eval": "Math.round(window.__gone - window.__click)"})
+        self.assertTrue(got[2]["eval"] and got[2]["eval"]["up"], got[2]["eval"])
+        self.assertGreaterEqual(got[-1]["eval"], got[2]["eval"]["ms"] - 20)
+        self.assertLess(got[-1]["eval"], 2000)
+        self.taken("r1", "r2", "r3")
+
+    # every frame from the answer until the answered slide is gone: what the leaving card looks like
+    FRAMES = ("window.__rec = []; window.__h = document.querySelector('.ag-layer .ag-slide:not([inert]) > .card').getBoundingClientRect().height;"
+              " (function tick() { const st = document.querySelector('.ag-layer .ag-stage'); if (!st) return void (window.__done = true);"
+              " for (const s of st.children) { const c = s.querySelector(':scope > .card'), l = c.querySelector('.sent-line');"
+              " window.__rec.push({leaving: s.inert, mine: !!c.dataset.sending, sent: c.classList.contains('sent'), line: !!l && l.getClientRects().length > 0,"
+              " h: Math.round(c.getBoundingClientRect().height), checked: c.querySelectorAll('input:checked').length,"
+              " text: c.querySelector('textarea.other')?.value || '', tint: (() => { const p = c.querySelector('.opt.pick:has(input:checked)'),"
+              " q = c.querySelector('.opt.pick:not(:has(input:checked))'); return !!p && !!q && getComputedStyle(p).backgroundColor !== getComputedStyle(q).backgroundColor; })()}); }"
+              " if ([...st.children].some((x) => x.inert) || !window.__rec.some((r) => r.leaving)) requestAnimationFrame(tick); else window.__done = true; })();")
+
+    def frames(self, act):
+        got = self.page({"eval": "(() => { window.__done = false; " + self.FRAMES + " " + act + "; return 1; })()"},
+                        {"until": "window.__done", "ms": 8000}, {"eval": "[window.__h, window.__rec.filter((r) => r.leaving || r.mine)]"})
+        h, rec = got[-1]["eval"]
+        self.assertGreater(len(rec), 3)                                   # the answered card, frame by frame from the click
+        for r in rec:
+            self.assertFalse(r["sent"] or r["line"], r)                  # never the receipt line "Your answer: … — sending"
+            self.assertLessEqual(abs(r["h"] - round(h)), 1, r)           # never folded: the card as it was answered
+        return rec
+
+    def test_an_answer_leaves_as_it_was_given_without_the_receipt_line(self):
+        self.ask("r1", "Какие проверки добавить в CI?", multi=True)
+        self.ask("r2", "Откатываем выпуск?")
+        self.ask("r3", "Как назовём новую очередь?")
+        self.ask("r4", "Последний?")
+        self.opened()
+        rec = self.frames("const s = document.querySelector('.ag-layer .ag-slide:not([inert])'), b = s.querySelectorAll('input[type=checkbox]');"
+                          " b[0].click(); b[2].click(); s.querySelector('button[type=submit]').click()")
+        self.assertTrue(all(r["checked"] == 2 for r in rec))             # with what was picked
+        self.page({"until": f"{CUR}?.includes('Откатываем')", "ms": 8000})
+        rec = self.frames("document.querySelector('.ag-layer .ag-slide:not([inert]) label.opt').click()")
+        self.assertTrue(all(r["checked"] == 1 and r["tint"] for r in rec))   # a tapped option keeps its tint
+        self.page({"until": f"{CUR}?.includes('Как назовём')", "ms": 8000},
+                  {"eval": "document.querySelector('.ag-layer .ag-slide:not([inert]) textarea.other').focus(), 1"}, {"typed": "orders-retry"})
+        rec = self.frames("document.querySelector('.ag-layer .ag-slide:not([inert]) form').requestSubmit()")
+        self.assertTrue(all(r["text"] == "orders-retry" for r in rec))   # with the typed answer
+        # the last one: it leaves the same way while the mode closes
+        self.page({"until": f"{CUR}?.includes('Последний?')", "ms": 8000})
+        self.frames("document.querySelector('.ag-layer .ag-slide:not([inert]) label.opt').click()")
+        self.page({"until": f"!document.querySelector('{LAYER}')", "ms": 8000})
+        self.taken("r1", "r2", "r3", "r4")
+
+    # the answers wait until the test lets them go (__release): then the core refuses them, or they go on to it (__pass)
+    HOLD = ("window.__held = []; window.__pass = false; const f = window.fetch; window.fetch = (u, o) => String(u).includes('/api/answer')"
+            " ? new Promise((ok) => window.__held.push(() => ok(window.__pass ? f(u, o)"
+            " : new Response(JSON.stringify({error: 'вопрос уже закрыт'}), {status: 409})))) : f(u, o);"
+            " window.__release = () => { const n = window.__held.length; window.__held.splice(0).forEach((go) => go()); return n; };")
+
+    def test_a_refused_answer_brings_its_card_back_whole_with_the_reason(self):
+        # the card flies away at once, the refusal comes later (during the flight, or after it): the card is shown again,
+        # whole, with the reason — unless the owner is typing in another card, then the reason is in the header
+        self.ask("r1", "Первый?")
+        self.ask("r2", "Второй?")
+        self.ask("r3", "Третий?")
+        card = ("(() => { const c = document.querySelector('.ag-layer .ag-slide:not([inert]) > .card');"
+                " return [c.querySelector('legend').textContent.trim(), c.classList.contains('sent'), !!c.querySelector('.sent-line'),"
+                " c.querySelector('.error-text')?.textContent, !!c.dataset.sending]; })()")
+        pick = "document.querySelector('.ag-layer .ag-slide:not([inert]) label.opt').click(), 1"
+        got = self.opened({"eval": pick}, {"eval": "window.__release()"},   # while it flies
+                          {"until": f"{COUNT} === '3 из 3' && {ONE}", "ms": 8000}, {"eval": card}, init=self.HOLD)
+        self.assertEqual(got[5]["eval"], 1)
+        self.assertEqual(got[-1]["eval"], ["Первый?", False, False, "Ответ не отправлен: вопрос уже закрыт", False])   # at the end now
+        got = self.page({"eval": pick}, {"until": f"{COUNT} === '2 из 2' && {ONE}", "ms": 8000}, {"eval": "window.__release()"},
+                        {"until": f"{COUNT} === '3 из 3' && {ONE}", "ms": 8000}, {"eval": card})
+        self.assertEqual(got[2]["eval"], 1)
+        self.assertEqual(got[-1]["eval"][0], "Первый?")                   # after its flight too
+        # typing in another card: the card waits at the end of the list, the reason is in the header
+        got = self.page({"key": "ArrowLeft"}, {"key": "ArrowLeft"}, {"until": f"{COUNT} === '1 из 3' && {CUR}?.includes('Второй?') && {ONE}"},
+                        {"eval": pick}, {"until": f"{COUNT} === '1 из 2' && {CUR}?.includes('Третий?') && {ONE}", "ms": 8000},
+                        {"eval": "document.querySelector('.ag-layer .ag-slide:not([inert]) textarea.other').focus(), 1"}, {"typed": "мой текст"},
+                        {"eval": "window.__release()"}, {"until": f"{COUNT} === '1 из 3'", "ms": 8000},
+                        {"until": "document.querySelector('.ag-layer .ag-say')?.textContent.includes('вопрос уже закрыт')", "ms": 8000},
+                        {"eval": f"[{CUR}, document.querySelector('.ag-layer .ag-slide:not([inert]) textarea.other').value]"})
+        self.assertIn("Третий?", got[-1]["eval"][0])
+        self.assertEqual(got[-1]["eval"][1], "мой текст")
+        self.assertEqual(sorted(self.pending()), ["r1", "r2", "r3"])
+
+    def test_a_typed_answer_on_its_way_when_the_question_closes_elsewhere_freezes_with_the_text(self):
+        self.ask("r1", "Как назовём очередь?")
+        self.ask("r2", "Второй?")
+        got = self.opened({"eval": "document.querySelector('.ag-layer .ag-slide:not([inert]) textarea.other').focus(), 1"},
+                          {"typed": "orders-retry"}, {"key": "Enter"},
+                          {"until": f"{COUNT} === '1 из 1' && {CUR}?.includes('Второй?')", "ms": 8000}, init=self.HOLD)
+        self.ev("permission.answered", "backend", request_id="r1", behavior="allow", channel="telegram", owner=True,
+                answers={"Как назовём очередь?": "Да"})
+        got = self.page({"until": f"{COUNT} === '1 из 2'", "ms": 8000}, {"eval": "window.__release()"},
+                        {"key": "ArrowRight"}, {"until": f"{COUNT} === '2 из 2' && {ONE}"},
+                        {"eval": "(() => { const c = document.querySelector('.ag-layer .ag-slide:not([inert]) > .card');"
+                                 " return [c.classList.contains('frozen'), c.querySelector('textarea.other').value, !!c.querySelector('.frozen-bar')]; })()"})
+        self.assertEqual(got[1]["eval"], 1)
+        self.assertEqual(got[-1]["eval"], [True, "orders-retry", True])   # the typed text is kept, as on the page's feed
+        self.assertEqual(self.pending(), ["r2"])
 
     def test_a_theme_with_an_endless_animation_in_the_card_does_not_stop_the_move(self):
         # a theme (unix-terminal) blinks the caret of every field with an infinite CSS animation: finishing it throws, and
@@ -298,7 +478,7 @@ class Gallery(e2e.PageInChrome):
         self.assertEqual(got[-3]["eval"], "msg")                         # no header button left: the session's field
         self.assertFalse(got[-2]["eval"])
         self.assertEqual(got[-1]["eval"], ["#/s/backend", False])        # as by Esc: the mode's history entry is given back
-        self.assertNotIn("r1", self.pending())
+        self.taken("r1")
 
     def test_a_reload_in_the_mode_with_no_questions_left_closes_it_without_errors(self):
         self.ask("r1", "Первый?")
@@ -505,7 +685,7 @@ class Gallery(e2e.PageInChrome):
                           {"until": f"{COUNT} === '1 из 1'", "ms": 8000}, {"eval": "window.__froze"})
         self.assertEqual(got[-4]["eval"], "orders retry")                # Space is a space in the field
         self.assertEqual(got[-1]["eval"], 0)
-        self.assertNotIn("r1", self.pending())
+        self.taken("r1")
 
     def test_the_widths_of_the_context_and_the_card_are_dragged_kept_and_reset(self):
         m = self.j.append("message.received", None, {"to": "backend", "text": "Посмотри логи", "channel": "web", "owner": True})
@@ -580,7 +760,7 @@ class Gallery(e2e.PageInChrome):
         self.assertEqual((got[-1]["eval"]["card"], got[-1]["eval"]["kept"]), (696, {"ctx": 380, "card": 696}))
         # the card leaves in the middle of a drag (here — a move to the other question): the drag ends, its widths are kept
         got = self.page({"eval": "document.querySelector('.ag-layer').focus(), 1"}, {"key": "ArrowLeft"}, {"until": f"{COUNT} === '1 из 2'"},
-                        {"until": f"{WID}?.ctx === 380", "ms": 3000}, {"eval": WID})
+                        {"until": f"{WID}?.ctx === 380 && {ONE}", "ms": 3000}, {"eval": WID})
         s = got[-1]["eval"]
         got = self.page({"eval": TO % (s["split"]["x"] + 60, s["split"]["y"])}, {"drag": SPLIT, "to": "#ag-to", "keep": True},
                         {"eval": "document.body.classList.contains('resizing')"}, {"key": "ArrowRight"}, {"until": f"{COUNT} === '2 из 2'"},
@@ -593,7 +773,7 @@ class Gallery(e2e.PageInChrome):
         self.assertEqual(kept["ctx"] + kept["card"], s["ctx"] + s["card"])
         # a phone: the context above the card, no handles
         got = self.page({"touch": True}, self.shot("widths-phone.png", width=390, height=780), {"key": "ArrowLeft"},
-                        {"until": f"{COUNT} === '1 из 2'"}, {"eval": WID})
+                        {"until": f"{COUNT} === '1 из 2' && {ONE}"}, {"eval": WID})
         p = got[-1]["eval"]
         self.assertIsNone(p["split"])
         self.assertIsNone(p["edge"])
