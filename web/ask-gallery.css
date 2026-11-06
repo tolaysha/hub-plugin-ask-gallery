@@ -8,7 +8,8 @@
 .ag-who .ag-av { display: inline-block; }
 .ag-x, .ag-nav .btn { width: 40px; height: 40px; min-height: 40px; padding: 0; justify-content: center; flex: none; }
 .ag-x { margin-right: calc(var(--space-2) * -1); }
-.ag-say { flex: 0 1 auto; min-width: 0; margin: 0; font-size: var(--text-sm); color: var(--destructive);
+/* small red text: pulled toward the text color, as the page's failed pill (base.css) — a light theme red alone is under 4.5:1 */
+.ag-say { flex: 0 1 auto; min-width: 0; margin: 0; font-size: var(--text-sm); color: color-mix(in oklch, var(--st-wait) 70%, var(--foreground));
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .ag-x .icon, .ag-nav .icon { width: 20px; height: 20px; }
 
@@ -48,16 +49,8 @@
 
 .ag-nav { grid-row: 3; display: flex; align-items: center; justify-content: center; gap: var(--space-4);
   padding: var(--space-3) var(--space-4) calc(var(--space-3) + env(safe-area-inset-bottom)); border-top: 1px solid var(--border); }
-.ag-nav[hidden] { display: none; }
 .ag-count { min-width: 7ch; text-align: center; font-size: var(--text-sm); color: var(--muted-foreground);
   font-variant-numeric: tabular-nums; }
-
-.ag-empty { grid-area: 2 / 1; display: grid; place-content: center; justify-items: center; gap: var(--space-2);
-  padding: var(--space-6); text-align: center; }
-.ag-empty[hidden] { display: none; }
-.ag-empty h3 { margin: 0; font-size: var(--text-lg); font-weight: 600; }
-.ag-empty .hint { margin: 0 0 var(--space-3); color: var(--muted-foreground); }
-.ag-empty-icon { width: 32px; height: 32px; color: var(--muted-foreground); }
 
 @media (max-width: 720px) {
   .ag-top { padding-inline: var(--space-4); }

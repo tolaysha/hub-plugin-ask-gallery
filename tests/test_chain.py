@@ -10,12 +10,11 @@ CHAIN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NODE = shutil.which("node")
 
 
-def run(rows, rid=None, msgs=None, more=False, what="context"):
-    js = (f"import {{ context, answering }} from {json.dumps(CHAIN)};"
+def run(rows, rid=None, msgs=None, more=False):
+    js = (f"import {{ context }} from {json.dumps(CHAIN)};"
           f" const rows = {json.dumps(rows)}, msgs = {json.dumps(msgs or {})};"
-          + (f" const c = context(rows, {json.dumps(rid)}, msgs, {json.dumps(more)});"
-             " console.log(JSON.stringify(c && {ask: c.ask?.seq ?? null, answer: c.answer?.seq ?? null, said: c.said.map((x) => x.text), whole: c.whole}));"
-             if what == "context" else " console.log(JSON.stringify(answering(rows, msgs)));"))
+          f" const c = context(rows, {json.dumps(rid)}, msgs, {json.dumps(more)});"
+          " console.log(JSON.stringify(c && {ask: c.ask?.seq ?? null, answer: c.answer?.seq ?? null, said: c.said.map((x) => x.text), whole: c.whole}));")
     r = subprocess.run([NODE, "--input-type=module", "-e", js], capture_output=True, text=True, timeout=30)
     if r.returncode:
         raise AssertionError(r.stderr)
@@ -59,18 +58,49 @@ class Rows:
 
 @unittest.skipUnless(NODE, "нужен node")
 class Chain(unittest.TestCase):
-    def test_the_turn_the_answer_started_before_and_after_the_card(self):
+    def test_the_answers_turn_shows_the_question_the_answer_and_the_text_right_before_the_card(self):
         r = Rows()
         r.owner("сделай очередь"); r.said("работаю"); p = r.ask("r1")
         a = r.answer("r1"); r.said("принято"); r.ask("r2"); r.said("жду решения")
-        self.assertEqual(run(r.rows, "r2"), {"ask": p["seq"], "answer": a["seq"], "said": ["принято", "жду решения"], "whole": True})
+        self.assertEqual(run(r.rows, "r2"), {"ask": p["seq"], "answer": a["seq"], "said": ["принято"], "whole": True})
 
-    def test_someone_elses_turn_between_is_left_out(self):
+    def test_only_the_text_after_the_previous_tool_not_earlier_pieces_of_the_turn(self):
         r = Rows()
-        p = r.ask("r1"); a = r.answer("r1"); r.said("отдала исполнителю")
-        r.other("готово"); r.said("разбираю отчёт"); r.ask("r2")
-        self.assertEqual(run(r.rows, "r2")["said"], ["отдала исполнителю"])
-        self.assertEqual(run(r.rows, "r2")["ask"], p["seq"])
+        r.owner("сделай"); r.said("смотрю логи"); r.add("tool", name="Bash"); r.said("нашла причину"); r.said("предлагаю откат")
+        r.add("tool", name="AskUserQuestion"); r.ask("r1")   # the card's own call
+        self.assertEqual(run(r.rows, "r1")["said"], ["предлагаю откат"])
+
+    def test_an_earlier_card_and_the_turns_start_are_boundaries(self):
+        r = Rows()
+        r.owner("сделай"); r.said("про первый"); r.ask("r1"); r.ask("r2"); r.said("итог")
+        self.assertEqual(run(r.rows, "r2")["said"], ["итог"])   # not the text of the card before it
+        r = Rows()
+        r.owner("а"); r.said("старый ход"); r.owner("б"); r.ask("r1")
+        self.assertEqual(run(r.rows, "r1")["said"], [])         # not the text of the turn before
+
+    def test_with_no_text_right_before_the_card_the_turns_last_text_after_it(self):
+        r = Rows()
+        r.owner("сделай"); r.said("смотрю логи"); r.add("tool", name="Bash"); r.ask("r1")
+        r.said("пока жду, проверяю миграции"); r.add("tool", name="Bash"); r.said("итог: жду ответа на r1")
+        r.owner("следующее"); r.said("это уже другой ход")
+        self.assertEqual(run(r.rows, "r1")["said"], ["итог: жду ответа на r1"])
+        self.assertEqual(run(r.rows[:5], "r1")["said"], ["пока жду, проверяю миграции"])   # the turn still runs: its latest text
+
+    def test_a_turn_someone_else_started_shows_only_its_own_text(self):
+        # an answer given turns earlier belongs to another question: not shown next to this one
+        r = Rows()
+        r.ask("r1"); r.answer("r1"); r.said("отдала исполнителю")
+        r.other("готово"); r.said("разбираю отчёт"); r.ask("r2"); r.said("жду решения")
+        self.assertEqual(run(r.rows, "r2"), {"ask": None, "answer": None, "said": ["разбираю отчёт"], "whole": True})
+
+    def test_questions_asked_in_different_turns_after_one_answer_do_not_share_it(self):
+        r = Rows()
+        r.ask("r1"); r.answer("r1"); r.said("принято")
+        r.other("отчёт по первой задаче"); r.said("первая готова"); r.ask("r2")
+        r.other("напоминание", sender="hub"); r.add("tool"); r.ask("r3")   # its turn: no text of the session
+        r.other("отчёт по второй задаче", sender="worker-2"); r.said("вторая готова"); r.ask("r4")
+        got = [run(r.rows, rid) for rid in ("r2", "r3", "r4")]
+        self.assertEqual([(c["ask"], c["said"]) for c in got], [(None, ["первая готова"]), (None, []), (None, ["вторая готова"])])
 
     def test_the_owners_own_message_ends_the_chain(self):
         r = Rows()
@@ -82,7 +112,7 @@ class Chain(unittest.TestCase):
         r = Rows()
         r.ask("r1"); r.answer("r1"); r.said("принято")
         r.owner("кстати", midturn=True); r.add("in", id="mx", text="тебе", relayed="hub"); r.said("учла"); r.ask("r2")
-        self.assertEqual(run(r.rows, "r2")["said"], ["принято", "учла"])
+        self.assertEqual(run(r.rows, "r2")["said"], ["учла"])
 
     def test_an_answer_waiting_in_the_queue_starts_nothing_yet(self):
         r = Rows()
@@ -90,15 +120,13 @@ class Chain(unittest.TestCase):
         a = r.answer("r1"); r.said("пока не читала ответ"); r.ask("r3")
         msgs = {f"m{a['seq']}": {"state": "queued"}}
         got = run(r.rows, "r3", msgs)
-        self.assertEqual((got["ask"], got["said"]), (None, ["начала", "пока не читала ответ"]))
-        self.assertEqual(run(r.rows, msgs=msgs, what="answering"), "queued")
+        self.assertEqual((got["ask"], got["said"]), (None, ["пока не читала ответ"]))
 
     def test_a_message_taken_together_with_the_answer_is_the_same_turn(self):
         r = Rows()
         p = r.ask("r1"); r.answer("r1"); r.other("fyi: заметка", sender="hub"); r.said("принято"); r.ask("r2")
         got = run(r.rows, "r2")
         self.assertEqual((got["ask"], got["said"]), (p["seq"], ["принято"]))
-        self.assertEqual(run(r.rows, what="answering"), "working")
 
     def test_an_answer_taken_after_a_message_in_the_same_run_still_makes_it_the_answers_turn(self):
         r = Rows()
@@ -113,13 +141,27 @@ class Chain(unittest.TestCase):
         got = run(r.rows, "r3")
         self.assertEqual((got["ask"], got["answer"]), (p2["seq"], a2["seq"]))
 
-    def test_rows_that_begin_inside_someone_elses_turn_after_the_answer_ask_for_more(self):
+    def test_rows_that_begin_with_the_questions_turn_need_no_earlier_ones(self):
         r = Rows()
         r.ask("r1"); r.answer("r1"); r.said("отдала исполнителю")
         r.other("готово"); r.said("разбираю"); r.ask("r2")
-        tail = [x for x in r.rows if x["kind"] != "ask" or x["request_id"] == "r2"]
-        tail = [x for x in tail if x["seq"] > r.rows[3]["seq"]]   # loaded from inside the answer's turn: its start is missing
+        tail = [x for x in r.rows if x["seq"] >= r.rows[3]["seq"]]   # the loaded rows begin before the question's turn
+        self.assertEqual(run(tail, "r2", more=True), {"ask": None, "answer": None, "said": ["разбираю"], "whole": True})
+
+    def test_rows_that_begin_with_the_questions_turn_ask_for_more(self):
+        # the turn may have begun with a run of messages cut by the page: an answer taken with a hub note
+        r = Rows()
+        p = r.ask("r1"); r.said("жду"); a = r.answer("r1"); r.other("fyi: заметка", sender="hub"); r.said("принято"); r.ask("r2")
+        tail = [x for x in r.rows if x["seq"] > a["seq"]]   # the page boundary falls between the answer and the note
         self.assertFalse(run(tail, "r2", more=True)["whole"])
+        self.assertEqual(run(r.rows, "r2")["ask"], p["seq"])
+
+    def test_an_answers_turn_whose_question_is_before_the_rows_asks_for_more(self):
+        r = Rows()
+        r.ask("r1"); a = r.answer("r1"); r.said("принято"); r.ask("r2")
+        tail = [x for x in r.rows if x["seq"] > 1]   # the answered question is on an earlier page
+        self.assertEqual(run(tail, "r2", more=True), {"ask": None, "answer": a["seq"], "said": ["принято"], "whole": False})
+        self.assertTrue(run(tail, "r2")["whole"])   # no earlier rows at all: what is there is all
 
     def test_the_same_question_asked_again_after_its_answer(self):
         r = Rows()
@@ -135,16 +177,13 @@ class Chain(unittest.TestCase):
                        "from": {"kind": "owner"}, "answer_to": f"q{p['seq']}"})
         r.said("ладно"); r.ask("r2")
         got = run(r.rows, "r2")
-        self.assertEqual((got["answer"], got["said"]), (None, ["ладно"]))   # the closing message is someone else's turn: skipped
-        self.assertEqual(run(r.rows, what="answering"), None)
-        closed = next(x for x in r.rows if x.get("answer_to"))
-        self.assertIsNone(run(r.rows, msgs={closed["id"]: {"state": "queued"}}, what="answering"))   # nothing to wait for
+        self.assertEqual((got["answer"], got["said"]), (None, ["ладно"]))   # the closing message starts the question's turn: its text only
 
     def test_an_answer_to_a_tool_permission_is_not_a_question_form(self):
         r = Rows()
         r.owner("почини"); r.said("нужен доступ"); r.ask("p1", tool="Bash"); r.answer("p1", relay=False); r.said("запустила"); r.ask("r2")
         got = run(r.rows, "r2")
-        self.assertEqual((got["answer"], got["said"]), (None, ["нужен доступ", "запустила"]))
+        self.assertEqual((got["answer"], got["said"]), (None, ["запустила"]))
 
     def test_an_answer_inside_a_running_turn(self):
         r = Rows()

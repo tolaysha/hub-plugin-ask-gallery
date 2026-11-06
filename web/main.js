@@ -1,47 +1,42 @@
 // "Questions only": a session mode where the whole screen holds only its open questions, a gallery of one at a time, and
-// next to each card what led to it (chain.js): the earlier question and the owner's answer, then the session's text of
-// the turn that answer started. A card is the page's own question card (cards.js askCard): the answer goes the same
-// /api/answer way with retries and a receipt, "close without an answer" the same /api/question/dismiss; the plugin sends
-// nothing of its own to the core and only reads the feed (/api/history). It keeps only the open session's name for the
-// tab's life (sessionStorage): the page reloads after a hub update, the mode stays. The mode takes one history entry, so
-// Back (the phone's back gesture) leaves it. With no open questions left it goes back to the hub by itself.
+// next to each card what led to it (chain.js): the session's text nearest to it in the turn it was asked in, and when
+// that turn was started by the owner's answer, the earlier question and that answer first. A card is the page's own question
+// card (cards.js askCard): the answer goes the same /api/answer way with retries and a receipt, "close without an answer"
+// the same /api/question/dismiss; the plugin sends nothing of its own to the core and only reads the feed (/api/history).
+// It keeps only the open session's name for the tab's life (sessionStorage): the page reloads after a hub update, the mode
+// stays. The mode takes one history entry, so Back (the phone's back gesture) leaves it. With no open questions left it
+// goes back to the hub at once.
 import { askCard } from "/static/js/cards.js";
 import { avatarNode } from "/static/js/dom.js";
 import { S, sessionLabel } from "/static/js/state.js";
 import { V } from "/static/js/recorder.js";
 import { dictationIn } from "/static/js/dictate.js";
 import { item, keyOf } from "/static/js/feed.js";
-import { answering, context } from "./chain.js";
+import { context } from "./chain.js";
 
 const WORDS = {
   ru: { open: "Только вопросы", openN: (n) => `Только вопросы: открыто ${n}`, exit: "Выйти из режима вопросов (Esc)",
     of: (i, n) => `${i} из ${n}`, prev: "Предыдущий вопрос (←)", next: "Следующий вопрос (→)", nav: "Вопросы",
-    none: "Вопросов больше нет", leaving: "Возвращаемся в хаб.", working: "Сессия работает над вашим ответом — новый вопрос появится здесь.",
-    queued: "Ваш ответ ждёт своей очереди у сессии — новый вопрос появится здесь.",
-    toHub: "Перейти в хаб", label: (name) => `Вопросы сессии ${name}`, drop: "Убрать",
-    context: "Что было перед вопросом", loading: "Загружаю контекст…", failed: "Не удалось загрузить контекст", retry: "Повторить",
+    label: (name) => `Вопросы сессии ${name}`, drop: "Убрать",
+    context: "Контекст вопроса", loading: "Загружаю контекст…", failed: "Не удалось загрузить контекст", retry: "Повторить",
     more: "ещё", less: "свернуть" },
   en: { open: "Questions only", openN: (n) => `Questions only: ${n} open`, exit: "Leave questions mode (Esc)",
     of: (i, n) => `${i} of ${n}`, prev: "Previous question (←)", next: "Next question (→)", nav: "Questions",
-    none: "No more questions", leaving: "Going back to the hub.", working: "The session is working on your answer; a new question will show up here.",
-    queued: "Your answer waits in the session's queue; a new question will show up here.",
-    toHub: "Go to the hub", label: (name) => `Questions of ${name}`, drop: "Remove",
-    context: "What came before the question", loading: "Loading the context…", failed: "Could not load the context", retry: "Retry",
+    label: (name) => `Questions of ${name}`, drop: "Remove",
+    context: "Context of the question", loading: "Loading the context…", failed: "Could not load the context", retry: "Retry",
     more: "more", less: "less" },
 };
 const KEEP = "ask-gallery.open";   // sessionStorage: the session whose questions are open
 const MARK = "askGallery";         // the mode's own history entry (history.state[MARK] = the session)
 const TICK = 250;                   // how often the open mode looks at the snapshot and at the shown card
 const SHIFT = 24;                   // percent of the card width it travels while sliding
-const LEAVE = 1000;                 // "No more questions" stays this long, then the mode leaves by itself
-const GRACE = 2500;                 // after an answer here, how long the session counts as busy with it before its turn shows
 const PAGE = 200, PAGES = 10;       // the context: feed rows asked from /api/history at a time, and how far back at most (pages of a session)
 const POLL = 3000;                  // the context's rows: newer ones this often (the session's text after the card)
 
 let hub, W;
 const cards = new Map();   // key -> { node: askCard form, slide, ctx: context box, asker, rid, frozen? } — typed text survives snapshots
 const feeds = new Map();   // session -> { rows: Map key -> row, more, loading, failed, pages, newest, polled } — the context's rows
-let m = null;              // the open mode: { name, items: [key], cur, slide, layer parts, timer, opener, answered: Map, leave }
+let m = null;              // the open mode: { name, items: [key], cur, slide, layer parts, timer, opener }
 
 const quiet = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
 const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -89,16 +84,6 @@ function build() {
   say.hidden = true;
   top.append(who, say, x);
   const stage = hub.el("div", "ag-stage");
-  const empty = hub.el("div", "ag-empty");
-  empty.hidden = true;
-  const art = plugIcon("ask");
-  art.classList.add("ag-empty-icon");
-  const go = hub.el("button", "btn primary ag-home", W.toHub);
-  go.type = "button";
-  go.addEventListener("click", () => close());
-  const why = hub.el("p", "hint");
-  why.setAttribute("role", "status");
-  empty.append(art, hub.el("h3", null, W.none), why, go);
   const nav = hub.el("nav", "ag-nav");
   nav.setAttribute("aria-label", W.nav);
   const prev = button("ag-prev", W.prev, plugIcon("back")), next = button("ag-next", W.next, plugIcon("forward"));
@@ -107,20 +92,21 @@ function build() {
   prev.addEventListener("click", () => step(-1));
   next.addEventListener("click", () => step(1));
   nav.append(prev, count, next);
-  layer.append(top, stage, empty, nav);
+  layer.append(top, stage, nav);
   swipe(stage);
-  return { layer, who, say, stage, empty, why, nav, prev, next, count, home: go, sig: null };
+  return { layer, who, say, stage, prev, next, count, sig: null };
 }
 
 function open(name, opener) {
   if (m) return;
   if (history.state?.[MARK] !== name) history.pushState({ ...history.state, [MARK]: name }, "");   // a reload is already on it
-  m = { name, items: [], cur: null, slide: null, opener: opener || null, answered: new Map(), leave: 0, ...build() };
+  m = { name, items: [], cur: null, slide: null, opener: opener || null, ...build() };
   try { sessionStorage.setItem(KEEP, name); } catch { /* no storage */ }
   document.body.append(m.layer);
   const app = document.getElementById("app");
   if (app) app.inert = true;   // Tab and screen readers stay inside the mode
   sync(true);
+  if (!m) return;   // nothing to answer (a reload after the last question left): the mode has closed already
   m.timer = setInterval(() => sync(false), TICK);
   m.layer.focus();
 }
@@ -130,19 +116,17 @@ function close(fromHistory = false) {
   if (!m) return;
   if (!fromHistory && history.state?.[MARK]) history.back();
   clearInterval(m.timer);
-  clearTimeout(m.leave);
   m.layer.remove();
   m.slide?.remove();
   const app = document.getElementById("app");
   if (app) app.inert = false;
   try { sessionStorage.removeItem(KEEP); } catch { /* no storage */ }
-  const back = m.opener;
+  const back = m.items.length ? m.opener : null;   // none left: the header button is going away, the page has not hidden it yet
   m = null;
   prune();
   feeds.clear();   // read anew next time: the page's feed moves on meanwhile, the rows kept here would have a gap
   if (back?.isConnected && back.getClientRects().length) back.focus();
-  // no questions left — the header button is hidden: the session's field, except on a touch screen (its keyboard would
-  // come up by itself)
+  // no questions left: the session's field, except on a touch screen (its keyboard would come up by itself)
   else if (!matchMedia("(pointer: coarse)").matches) document.getElementById("msg")?.focus();
 }
 
@@ -158,7 +142,6 @@ function sync(first) {
     if (!k.startsWith(m.name + ":")) continue;
     if (!c.node.dataset.got && ours(c.node)) {
       c.node.dataset.got = "1";   // the core recorded our own answer: it leaves, never frozen
-      m.answered.set(c.asker, Date.now());
     }
     if (open.has(k)) { if (c.frozen) cards.delete(k); continue; }   // the same question open again: a live card
     // closed elsewhere (another device, Telegram) while the owner was typing here: the card stays, frozen, with the
@@ -187,14 +170,16 @@ function sync(first) {
   if (m.say.textContent !== say) { m.say.textContent = say; m.say.hidden = !say; }
   const before = m.items;
   m.items = [...before.filter((k) => keep.has(k)), ...live.filter((k) => !before.includes(k))];
-  if (first) show(m.items[0] || null, 1, false, true);
-  else if (!m.cur) show(m.items[0] || null, 1, false);   // the empty screen: a new question slides in
+  // nothing left to answer: back to the hub at once, as by Esc — without waiting for the session to take the answer.
+  // A frozen card counts as a question: the owner's typed or dictated text holds the mode
+  if (!m.items.length) return void close();
+  if (first) show(m.items[0], 1, false, true);
   else if (!keep.has(m.cur)) {
     // the shown question is answered or closed: it leaves, the one after it comes (the one before it, if it was the last)
     const was = before.indexOf(m.cur);
     const after = before.slice(was + 1).find((k) => keep.has(k));
     const prior = before.slice(0, was).reverse().find((k) => keep.has(k));
-    show(after || prior || null, after ? 1 : -1, true);
+    show(after || prior || m.items[0], after ? 1 : -1, true);   // or one that came on the same tick
   } else if (cards.get(m.cur)?.slide !== m.slide) {
     const k = m.cur;   // the same question was asked again: its live card takes the frozen one's place
     m.cur = null;
@@ -246,41 +231,10 @@ function freeze(c) {
 }
 
 function paint() {
-  const n = m.items.length, at = Math.max(m.items.indexOf(m.cur), 0);
-  m.empty.hidden = !!n;
-  m.nav.hidden = !n;
-  const of = n ? W.of(at + 1, n) : "";
+  const n = m.items.length, at = Math.max(m.items.indexOf(m.cur), 0), of = W.of(at + 1, n);
   if (m.count.textContent !== of) m.count.textContent = of;   // a live region: rewritten only when it changes
   m.prev.disabled = at <= 0;
   m.next.disabled = at >= n - 1;
-  // nothing left to answer: "No more questions" for a moment, then back to the hub as by Esc. A frozen card counts as a
-  // question (its text is still there); a recording, a field being typed into and a session working on the owner's
-  // answer hold it (a reply and a new question may come); a new question cancels it
-  const busy = !n && working();
-  const why = busy === "queued" ? W.queued : busy ? W.working : W.leaving;
-  if (m.why.textContent !== why) m.why.textContent = why;
-  if (!done(busy)) { clearTimeout(m.leave); m.leave = 0; }
-  else if (!m.leave) m.leave = setTimeout(() => { if (!m) return; m.leave = 0; sync(false); if (m && done()) close(); }, LEAVE);
-}
-const done = (busy = working()) => !m.items.length && !busy && !V.rec && !V.opening && !typing(document.activeElement);
-
-// a session the owner answered here, or the mode's own one, still has the owner's answer to work on: "queued" — the answer
-// waits in its queue, "working" — it is in a turn the answer started; null — no
-function working() {
-  const snap = hub.snapshot();
-  const names = new Set([m.name, ...m.answered.keys()]);
-  let out = null;
-  for (const name of names) {
-    const s = (snap?.sessions || []).find((x) => x.name === name);
-    if (!s) continue;
-    const t = m.answered.get(name), busy = ["busy", "starting"].includes(s.state);
-    if (t && Date.now() - t < GRACE) out ||= "working";   // the answer is on its way to the session: its turn has not shown yet
-    const known = feeds.has(name) || S.cur?.name === name;
-    const what = known ? answering(rowsOf(name), snap.messages || {}) : null;
-    if (what === "queued") return "queued";
-    if ((what === "working" || (!known && t)) && busy) out ||= "working";   // without its rows: busy after our answer
-  }
-  return out;
 }
 
 // keys: a plain swap (motion on a keyboard shortcut only delays the next press); buttons and a swipe slide
@@ -300,7 +254,9 @@ function show(key, dir, answered, still = false) {
   const from = m.slide, to = key ? cards.get(key)?.slide || null : null;
   m.cur = key;
   m.slide = to;
-  for (const a of m.stage.getAnimations({ subtree: true })) a.finish();   // a quick second move does not stack up
+  // a quick second move does not stack up. Only the slides' own moves, never an endless one: inside a card there may run
+  // one (a theme's blinking caret, the dictation spinner), and finishing it throws — the move would stop halfway
+  for (const s of m.stage.children) for (const a of s.getAnimations()) if (a.effect?.getComputedTiming().endTime !== Infinity) a.finish();
   if (from === to) return;
   // the focus was on the leaving card, or already dropped to the page (cards.js blurs the card it sends from)
   const f = document.activeElement, lost = (!!from && from.contains(f)) || f === m.layer || !m.layer.contains(f);
@@ -309,7 +265,7 @@ function show(key, dir, answered, still = false) {
     to.inert = false;
   }
   paint();
-  if (lost) (to ? m.layer : m.home).focus({ preventScroll: true });   // ←/→ keep working; nothing left — "Go to the hub"
+  if (lost) m.layer.focus({ preventScroll: true });   // ←/→ keep working
   const calm = quiet(), fade = calm && answered;
   still ||= calm && !answered;
   const ease = css("--ease-out") || "ease-out", out = ms("--dur-fast", 160), inn = ms("--dur", 240);
@@ -425,7 +381,7 @@ function fill(c) {
   if (f.pages && key !== c.key) { c.key = key; c.got = context(rowsOf(c.asker), c.rid, snap?.messages || {}, f.more); }
   const got = f.pages ? c.got : null;
   const older = f.pages && f.more && free && f.pages < PAGES && (c.pages || 0) < PAGES;
-  // its row is older than the loaded ones, or the chain goes on before them: earlier pages
+  // its row is older than the loaded ones, or its turn, or the answered question, begins before them: earlier pages
   if (older && ((!got && c.at != null && c.at < Math.min(...[...f.rows.values()].map((it) => it.ts))) || (got && !got.whole))) {
     c.pages = (c.pages || 0) + 1;
     load(c.asker);
