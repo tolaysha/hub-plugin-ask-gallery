@@ -7,7 +7,7 @@
     "items": {
       "back": { "id": "84994", "commonName": "back" },
       "forward": { "id": "86517", "commonName": "forward" },
-      "ask": { "id": "86462", "commonName": "ask-question" },
+      "ask": { "id": "Du9MsP2VYLTy", "commonName": "question-mark", "pack": "fluent-systems-regular", "color": "#e5484d", "source": "иконка плагина (hub-plugin.json) в скруглённой рамке; знак — тонкий контур fluent, а не m_outlined: залитый знак m_outlined в 40px сливается с рамкой; цвет вшит — «Настройки → Плагины» и маркетплейс показывают её через <img>" },
       "close": { "id": null, "commonName": "close", "source": "иконка хаба i-close из /static/icons.svg (hub.icon)" },
       "question": { "id": null, "commonName": "?", "source": "глиф «?» строки сессии, которая ждёт вас (sidebar.js GLYPH.dialog), цвет --st-wait" }
     }

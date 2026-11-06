@@ -598,3 +598,56 @@ class Gallery(e2e.PageInChrome):
         self.assertIsNone(p["split"])
         self.assertIsNone(p["edge"])
         self.assertLessEqual(p["right"], 390)
+
+    def test_the_plugin_icon_is_the_red_question_in_a_frame_on_every_theme(self):
+        # "Settings → Plugins" (and a catalog) shows the manifest icon as an <img>: the page's CSS does not reach inside it,
+        # so the color is in the file itself, one red readable on the light, the dark and a theme's tile
+        import xml.etree.ElementTree as ET
+        os.makedirs(os.path.join(self.state, "themes"))   # an own theme of the hub (next to hub.json): a dark one, as the terminal themes
+        with open(os.path.join(self.state, "themes", "phosphor.json"), "w") as f:
+            json.dump({"name": "Фосфор", "dark": True, "colors": {"background": "#1e2326", "foreground": "#b8c8b0", "card": "#232a2e",
+                       "muted": "#293134", "muted-foreground": "#97a598", "border": "#374145", "primary": "#83c092",
+                       "destructive": "#c9906f"}}, f)
+        row = "[...document.querySelectorAll('.plugin-row')].find((r) => r.querySelector('h4')?.textContent === 'ask-gallery')"
+        img = f"{row}?.querySelector('.plugin-icon img')"
+        # the colors the browser actually paints: every pixel of the drawn icon that is not transparent
+        paint = (f"(() => {{ const i = {img}, c = document.createElement('canvas'); c.width = c.height = 48;"
+                 " const x = c.getContext('2d'); x.drawImage(i, 0, 0, 48, 48); const d = x.getImageData(0, 0, 48, 48).data, out = {};"
+                 " for (let k = 0; k < d.length; k += 4) if (d[k + 3] === 255) { const v = `${d[k]},${d[k + 1]},${d[k + 2]}`; out[v] = (out[v] || 0) + 1; }"
+                 " return out; })()")
+        plugins = ({"local": {"hub.settingsTab": "plugins"}}, {"go": "about:blank"},
+                   {"go": f"http://127.0.0.1:{self.port}/#/settings"}, {"until": f"!!{row}", "ms": 8000},
+                   {"eval": f"{row}.scrollIntoView({{block: 'center'}}), 1"}, {"until": f"{img}?.naturalWidth > 0"})   # a lazy <img>: loads once on the screen
+        tile = {"eval": f"getComputedStyle({row}.querySelector('.plugin-icon')).backgroundColor"}   # under the icon, after a shot's theme
+        n = len(plugins)
+        got = self.page(*plugins,
+                        {"eval": f"{img}.getAttribute('src')"},
+                        {"eval": "fetch('/api/plugins/icon?name=ask-gallery').then((r) => r.text()).then((t) => { window.__svg = t; }), 1"},
+                        {"until": "typeof window.__svg === 'string'"}, {"eval": "window.__svg"}, {"eval": paint},
+                        self.shot("icon-settings-light.png", theme="light"), tile, self.shot("icon-settings-dark.png", theme="dark"), tile,
+                        {"local": {"hub.settingsTab": "theme"}}, {"go": "about:blank"}, {"go": f"http://127.0.0.1:{self.port}/#/settings"},
+                        {"until": "[...document.querySelectorAll('button')].some((b) => b.textContent.includes('Фосфор'))", "ms": 8000},
+                        {"eval": "[...document.querySelectorAll('button')].find((b) => b.textContent.includes('Фосфор')).click(), 1"},
+                        {"until": "getComputedStyle(document.documentElement).getPropertyValue('--background').trim() === '#1e2326'"},
+                        *plugins, self.shot("icon-settings-phosphor.png", theme="dark"), tile)
+        self.assertTrue(got[n]["eval"].startswith("/api/plugins/icon?name=ask-gallery"), got[n]["eval"])
+        svg = ET.fromstring(got[n + 3]["eval"])
+        self.assertEqual(svg.get("viewBox"), "0 0 48 48")
+        shapes = [e for e in svg.iter() if e.tag.rsplit("}", 1)[-1] in ("rect", "path")]
+        self.assertEqual([e.tag.rsplit("}", 1)[-1] for e in shapes], ["rect", "path"])     # the frame and the question mark
+        for e in shapes:   # every shape has its own color: no fill left to the default black
+            self.assertEqual(e.get("stroke"), "#e5484d")
+            self.assertIn(e.get("fill"), ("none", "#e5484d"))
+        drawn = got[n + 4]["eval"]
+        self.assertGreater(sum(drawn.values()), 150)                   # the frame and the glyph are there, not a blank
+        for rgb in drawn:   # opaque pixels are the red alone (the browser's color management may move a channel by one)
+            self.assertTrue(all(abs(a - b) <= 2 for a, b in zip(map(int, rgb.split(",")), (229, 72, 77))), rgb)
+        # the red reads on the tile of each theme: light, dark and the own dark one (3:1, a graphical object)
+        def lum(rgb):   # relative luminance (WCAG)
+            return sum(w * (c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4)
+                       for w, c in zip((0.2126, 0.7152, 0.0722), (v / 255 for v in rgb)))
+        tiles = [got[n + 6]["eval"], got[n + 8]["eval"], got[-1]["eval"]]
+        self.assertEqual(len(set(tiles)), 3, tiles)                    # three different tiles were measured
+        for bg in tiles:
+            a, b = sorted((lum((229, 72, 77)), lum(map(float, bg[bg.index("(") + 1:bg.index(")")].split(",")[:3]))))
+            self.assertGreaterEqual((b + 0.05) / (a + 0.05), 3, bg)
