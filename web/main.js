@@ -4,7 +4,7 @@
 // card is the page's own question card (cards.js askCard): the answer goes to the asking session the same /api/answer way
 // with retries and a receipt, "close without an answer" the same /api/question/dismiss; the plugin sends nothing of its
 // own to the core and only reads the feed (/api/history).
-// It keeps only where the mode was opened (a session's name, or ALL) for the tab's life (sessionStorage): the page reloads
+// It keeps only where the mode was opened (a session's name) for the tab's life (sessionStorage): the page reloads
 // after a hub update, the mode stays. In this browser it keeps the widths of the context and the card the owner dragged
 // them to (localStorage). The mode takes one history entry, so Back (the phone's back gesture) leaves it. With no open questions left it goes back to the
 // hub as soon as the last answered card has flown up.
@@ -24,7 +24,7 @@ const WORDS = {
     more: "ещё", less: "свернуть",
     split: "Ширина контекста и вопроса", edge: "Ширина вопроса",
     gripHint: "Тяните или ←/→ — ширина; двойной клик — по умолчанию",
-    all: (n) => `Только вопросы всех сессий: открыто ${n}`, sessions: "Сессии с вопросами",
+    sessions: "Сессии с вопросами",
     chip: (name, n) => `${name}: вопросов ${n} (сессии — ↑/↓)` },
   en: { open: "Questions only", openN: (n) => `Questions only: ${n} open`, exit: "Leave questions mode (Esc)",
     of: (i, n) => `${i} of ${n}`, prev: "Previous question (←)", next: "Next question (→)", nav: "Questions",
@@ -33,12 +33,11 @@ const WORDS = {
     more: "more", less: "less",
     split: "Width of the context and the question", edge: "Width of the question",
     gripHint: "Drag or ←/→ — the width; double-click — back to default",
-    all: (n) => `Questions only, every session: ${n} open`, sessions: "Sessions with questions",
+    sessions: "Sessions with questions",
     chip: (name, n) => `${name}: ${n} questions (sessions — ↑/↓)` },
 };
-const KEEP = "ask-gallery.open";   // sessionStorage: where the mode was opened — a session's name, or ALL
+const KEEP = "ask-gallery.open";   // sessionStorage: where the mode was opened — a session's name
 const MARK = "askGallery";         // the mode's own history entry (history.state[MARK] = the same)
-const ALL = "*";                   // opened from the sidebar: from the first session in the list
 const TICK = 250;                   // how often the open mode looks at the snapshot and at the shown card
 // a move between questions is a photo gallery's: both slides travel the stage's whole width together, quick off the mark
 // and slowing to a soft stop; an answered one flies up out of the stage in the same time
@@ -130,7 +129,7 @@ function build() {
   return { layer, who, say, bar, chips: new Map(), stage, prev, next, count, sig: null };
 }
 
-// from: a session's name — its questions first, then the other sessions'; ALL — from the first session in the list
+// from: a session's name — its questions first, then the other sessions'
 function open(from, opener) {
   if (m) return;
   if (history.state?.[MARK] !== from) history.pushState({ ...history.state, [MARK]: from }, "");   // a reload is already on it
@@ -184,7 +183,7 @@ function sync(first) {
   const snap = hub.snapshot();
   if (!snap || !m) return;
   const list = waiting(snap), byName = new Map((snap.sessions || []).map((x) => [x.name, x]));
-  if (first && m.from !== ALL) {
+  if (first) {
     // opened from a session: its questions first (the hub's header — the first one it shows, when it has none of its own)
     const s = byName.get(m.from), lead = s && !own(s).length ? s.shown?.[0]?.session ?? m.from : m.from;
     const at = list.findIndex((x) => x.name === lead);
@@ -254,9 +253,13 @@ function sync(first) {
     const here = cards.get(m.cur).node, why = cards.get(back).node.querySelector(".error-text")?.textContent;
     if (!((typed(here) || dictationIn(here)) && why && hub.banner(why))) show(back, Math.sign(m.items.indexOf(back) - m.items.indexOf(m.cur)), false);
   }
-  // the context of the shown card and of its neighbors, the ones ←/→ bring next: not the feeds of every session at once
+  // the context of the shown card and of the ones a move brings next — its neighbors (←/→) and each session's first
+  // question (↑/↓, a chip): read before the move, it comes in at its final height and does not jump when the rows come
   const at = m.items.indexOf(m.cur);
-  m.items.forEach((k, i) => { if (Math.abs(i - at) <= 1) fill(cards.get(k)); });
+  m.items.forEach((k, i) => {
+    if (Math.abs(i - at) <= 1) fill(cards.get(k));
+    else if (groupOf(m.items[i - 1]) !== groupOf(k)) fill(cards.get(k), false);   // read once, not polled for newer rows
+  });
   // a slide whose move is over is gone by its finish event; should the event not come, the next tick takes it away
   for (const x of [...m.stage.children]) if (x !== m.slide && !x.getAnimations().length) x.remove();
   paint();
@@ -410,12 +413,20 @@ function show(key, dir, answered, still = false) {
     if (s !== from && s !== to) s.remove();
   }
   if (from === to) return 0;
+  const card = from?.querySelector(":scope > .card");
+  if (card?.hidden) { card.dataset.agClosed = "1"; card.hidden = false; }   // closed without an answer: it leaves visibly too
+  // the answer just given: in this same task, before any paint, cards.js has folded the card into its receipt line ("Your
+  // answer: … — sending"). It leaves as the owner saw it when answering (a failed answer comes back whole: left)
+  if (card?.dataset.sending) { card.classList.remove("sent"); card.querySelector(".sent-line")?.remove(); }
+  // where the leaving one stands as the owner saw it: whole again, before the new one is in the stage
+  const was = from?.getBoundingClientRect();
   held?.();
   // the focus was on the leaving card, or already dropped to the page (cards.js blurs the card it sends from)
   const f = document.activeElement, lost = (!!from && from.contains(f)) || f === m.layer || !m.layer.contains(f);
   if (to) {
     if (to.parentNode !== m.stage) m.stage.append(to);
     to.inert = false;
+    pin(to, null);   // one that was leaving and is asked back: into the stage's grid again
   }
   paint();
   if (lost) m.layer.focus({ preventScroll: true });   // ←/→ keep working
@@ -427,12 +438,10 @@ function show(key, dir, answered, still = false) {
     fade ? { duration: out, easing: ease, delay: from ? out / 2 : 0, fill: "backwards" } : { duration: SLIDE, easing: EASE });
   if (!from) return 0;
   from.inert = true;
-  const card = from.querySelector(":scope > .card");
-  if (card.hidden) { card.dataset.agClosed = "1"; card.hidden = false; }   // closed without an answer: it leaves visibly too
-  // the answer just given: in this same task, before any paint, cards.js has folded the card into its receipt line ("Your
-  // answer: … — sending"). It leaves as the owner saw it when answering (a failed answer comes back whole: left)
-  if (card.dataset.sending) { card.classList.remove("sent"); card.querySelector(".sent-line")?.remove(); }
-  if (still) { from.remove(); return 0; }
+  if (still) { from.remove(); m.stage.scrollTop = 0; return 0; }
+  // the leaving one out of the stage's grid, where it stands: a taller one would stretch the grid's row, and the new one,
+  // centered in it, would come in lower and jump up when it is gone. The new one from its top, as it will stay
+  pin(from, was);
   const rise = from.getBoundingClientRect().bottom - m.stage.getBoundingClientRect().top;   // its bottom edge past the stage's top
   const gone = fade ? [{ opacity: 1 }, { opacity: 0 }] : answered
     ? [{ transform: "none", opacity: 1 }, { opacity: 1, offset: 0.6 }, { transform: `translateY(${-rise}px)`, opacity: 0 }]
@@ -440,6 +449,20 @@ function show(key, dir, answered, still = false) {
   const time = fade ? out : SLIDE, a = from.animate(gone, { duration: time, easing: fade ? ease : EASE });
   a.onfinish = a.oncancel = () => { if (m?.slide !== from) from.remove(); };
   return time;
+}
+
+// a leaving slide held where it stood (was: its box on screen), out of the stage's grid; null — back into the grid
+function pin(s, was) {
+  if (!was) {
+    if (s.classList.contains("ag-out")) { s.classList.remove("ag-out"); s.style.removeProperty("top"); s.style.removeProperty("left"); s.style.removeProperty("width"); }
+    return;
+  }
+  const st = m.stage.getBoundingClientRect();
+  m.stage.scrollTop = 0;
+  s.classList.add("ag-out");
+  s.style.top = `${was.top - st.top - m.stage.clientTop}px`;
+  s.style.left = `${was.left - st.left - m.stage.clientLeft}px`;
+  s.style.width = `${was.width}px`;
 }
 
 // ---- the context of a question ----
@@ -528,8 +551,8 @@ function bare(it) {
 }
 
 // the context of a card: asked for its session's feed, redrawn when what it shows changed (the session's text after the
-// card comes later than the card itself)
-function fill(c) {
+// card comes later than the card itself); poll: false — read, its newer rows not asked for on every POLL
+function fill(c, poll = true) {
   if (!c || c.frozen) return;
   const f = feedOf(c.asker), snap = hub.snapshot(), free = !f.loading && !f.building && !(f.failed && !f.pages);
   if (!f.pages && free) load(c.asker);
@@ -544,7 +567,7 @@ function fill(c) {
     c.pages = (c.pages || 0) + 1;
     load(c.asker);
   }
-  else if (f.pages && free && Date.now() - f.polled > POLL) load(c.asker, true);   // newer rows: its own row, its text after it
+  else if (poll && f.pages && free && Date.now() - f.polled > POLL) load(c.asker, true);   // newer rows: its own row, its text after it
   const rows = got ? [got.ask, got.answer, ...got.said].filter(Boolean) : [];
   const state = !f.pages ? (f.failed ? "failed" : "loading") : "ok";   // an earlier page failed: what is there stays
   const sig = `${state}|${rows.map(keyOf).join(",")}`;
@@ -747,33 +770,11 @@ function headButton(root, snap, ctx) {
   if (b.title !== label) { b.title = label; b.setAttribute("aria-label", label); }
 }
 
-// the entry from anywhere (sidebar.header): in the sidebar's search row, next to the page's red "Waiting for you" pill —
-// the same glyph and edge as the header button, and the number of open questions of every session; only while there are
-// any. The mode opens from the first session in the list
-function allButton(root, snap) {
-  const n = (snap?.sessions || []).flatMap(own).filter((w) => !left(w.key)).length;
-  let b = root.firstChild;
-  if (!b) {
-    b = hub.el("button", "btn small ag-open ag-all");
-    b.type = "button";
-    const g = hub.el("span", "glyph ag-q", "?");
-    g.setAttribute("aria-hidden", "true");
-    b.append(g, hub.el("span", "ag-n"));
-    b.addEventListener("click", () => { if ((hub.snapshot()?.sessions || []).flatMap(own).some((w) => !left(w.key))) open(ALL, b); });
-    root.append(b);
-  }
-  b.hidden = !n;
-  const num = b.querySelector(".ag-n"), label = W.all(n);
-  if (num.textContent !== String(n)) num.textContent = String(n);
-  if (b.title !== label) { b.title = label; b.setAttribute("aria-label", label); }
-}
-
 export default function register(api) {
   hub = api;
   W = WORDS[hub.lang] || WORDS.en;
   hub.addStyle("web/ask-gallery.css");
   hub.addSlot("session.header", { id: "open", order: 50, render: headButton });
-  hub.addSlot("sidebar.header", { id: "all", order: 50, render: allButton });
   addEventListener("keydown", keys, true);
   addEventListener("popstate", () => { if (m && history.state?.[MARK] !== m.from) close(true); });
   addEventListener("keyup", (e) => { if (m && e.code === "Space" && !pressable(document.activeElement) && !document.querySelector("dialog[open]")) e.stopImmediatePropagation(); }, true);

@@ -27,8 +27,10 @@
 @media (pointer: coarse) { .ag-chip { min-height: 40px; } }
 
 /* the card sits in the middle; a tall one scrolls inside the stage (auto margins: its top never goes out of reach) */
-.ag-stage { grid-area: 3 / 1; display: grid; overflow: auto; overflow-x: hidden; padding: var(--space-6) var(--space-4); }
+.ag-stage { grid-area: 3 / 1; position: relative; display: grid; overflow: auto; overflow-x: hidden; padding: var(--space-6) var(--space-4); }
 .ag-slide { grid-area: 1 / 1; width: min(680px, 100%); margin: auto; }
+/* a leaving slide (main.js pin): where it stood, out of the grid — the row is the new one's alone, it comes in where it stays */
+.ag-stage > .ag-slide.ag-out { position: absolute; grid-area: auto; margin: 0; }
 .ag-slide > .card { margin: 0; box-shadow: var(--shadow-lift); }
 /* an answered card flies away showing what was picked (a single choice has no circle: the row keeps its hover tint) */
 .ag-slide[inert] > .card .opt.pick:has(input:checked) { background: var(--accent); }
@@ -71,9 +73,6 @@
 .ag-open[hidden] { display: none; }
 .ag-open .ag-q { width: auto; color: var(--st-wait); font-weight: 700; }
 @media (max-width: 900px) { .ag-open .ag-t { display: none; } }   /* a narrow header: the glyph, the label in aria-label */
-/* the entry of every session's questions: in the sidebar's search row, as tall as its controls (sidebar.css --ctl-h) */
-.ag-all { min-width: var(--ctl-h); min-height: var(--ctl-h); height: var(--ctl-h); justify-content: center; font-size: var(--text-sm);
-  font-variant-numeric: tabular-nums; }
 
 /* closed elsewhere while typed into (main.js freeze): only the text and the "Remove" bar stay usable */
 .ag-slide > .card.frozen :is(.btns, .card-x, .other-row .btn:not(.dictate)) { display: none; }   /* a recording finishes */

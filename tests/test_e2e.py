@@ -52,6 +52,9 @@ LAYER = ".ag-layer"
 COUNT = "document.querySelector('.ag-layer .ag-count')?.textContent"
 CUR = "document.querySelector('.ag-layer .ag-slide:not([inert]) legend')?.textContent"
 ONE = "document.querySelectorAll('.ag-layer .ag-slide').length === 1"   # the move is over: only the shown slide is left
+# the feed's rows come 0.7 s late from here on (a big journal, a slow link)
+SLOW = ("(() => { const f = window.fetch; window.fetch = (u, o) => String(u).includes('/api/history')"
+        " ? new Promise((ok) => setTimeout(() => ok(f(u, o)), 700)) : f(u, o); return 1; })()")
 
 
 def load_tests(loader, standard, pattern):   # only this file's tests, not the inherited page suite
@@ -299,9 +302,11 @@ class Gallery(e2e.PageInChrome):
 
     # every frame from the answer until the answered slide is gone: what the leaving card looks like
     FRAMES = ("window.__rec = []; window.__h = document.querySelector('.ag-layer .ag-slide:not([inert]) > .card').getBoundingClientRect().height;"
+              " window.__top = document.querySelector('.ag-layer .ag-slide:not([inert]) > .card').getBoundingClientRect().top;"
               " (function tick() { const st = document.querySelector('.ag-layer .ag-stage'); if (!st) return void (window.__done = true);"
               " for (const s of st.children) { const c = s.querySelector(':scope > .card'), l = c.querySelector('.sent-line');"
               " window.__rec.push({leaving: s.inert, mine: !!c.dataset.sending, sent: c.classList.contains('sent'), line: !!l && l.getClientRects().length > 0,"
+              " top: c.getBoundingClientRect().top,"
               " h: Math.round(c.getBoundingClientRect().height), checked: c.querySelectorAll('input:checked').length,"
               " text: c.querySelector('textarea.other')?.value || '', tint: (() => { const p = c.querySelector('.opt.pick:has(input:checked)'),"
               " q = c.querySelector('.opt.pick:not(:has(input:checked))'); return !!p && !!q && getComputedStyle(p).backgroundColor !== getComputedStyle(q).backgroundColor; })()}); }"
@@ -309,13 +314,84 @@ class Gallery(e2e.PageInChrome):
 
     def frames(self, act):
         got = self.page({"eval": "(() => { window.__done = false; " + self.FRAMES + " " + act + "; return 1; })()"},
-                        {"until": "window.__done", "ms": 8000}, {"eval": "[window.__h, window.__rec.filter((r) => r.leaving || r.mine)]"})
-        h, rec = got[-1]["eval"]
+                        {"until": "window.__done", "ms": 8000}, {"eval": "[window.__h, window.__top, window.__rec.filter((r) => r.leaving || r.mine)]"})
+        h, top, rec = got[-1]["eval"]
         self.assertGreater(len(rec), 3)                                   # the answered card, frame by frame from the click
         for r in rec:
             self.assertFalse(r["sent"] or r["line"], r)                  # never the receipt line "Your answer: … — sending"
             self.assertLessEqual(abs(r["h"] - round(h)), 1, r)           # never folded: the card as it was answered
+            self.assertLessEqual(r["top"], top + 1, r)                    # from where it stood, up: never down first
         return rec
+
+    # every frame of a move, from the press until the shown slide stands alone and still, and a few after: where the shown
+    # card and its context are (their top edges, px from the window's top), how many slides the stage holds
+    SETTLE = ("window.__rec = []; window.__done = false; let after = 0; (function tick() {"
+              " const st = document.querySelector('.ag-layer .ag-stage'); if (!st) return void (window.__done = true);"
+              " const s = st.querySelector(':scope > .ag-slide:not([inert])'), c = s?.querySelector(':scope > .card'), x = s?.querySelector(':scope > .ag-ctx:not([hidden])');"
+              " if (c) window.__rec.push({n: st.children.length, top: Math.round(c.getBoundingClientRect().top),"
+              " ctx: x ? Math.round(x.getBoundingClientRect().top) : null, wait: !!x?.querySelector('.ag-ctx-note'), q: c.querySelector('legend')?.textContent.slice(0, 20)});"
+              " const still = st.children.length === 1 && !(s?.getAnimations().some((a) => a.playState === 'running'));"
+              " if (!still || ++after < 20) requestAnimationFrame(tick); else window.__done = true; })();")
+
+    def settle(self, act):
+        """The frames of one move (act starts it): the shown card and its context stand at their final height from the
+        first frame on, never lower and then jumping up."""
+        got = self.page({"eval": "(() => { " + self.SETTLE + " " + act + "; return 1; })()"},
+                        {"until": "window.__done", "ms": 8000}, {"eval": "window.__rec"})
+        rec = got[-1]["eval"]
+        two = [r for r in rec if r["n"] > 1]
+        self.assertGreater(len(two), 3, rec)                              # the move was seen, frame by frame
+        end = rec[-1]
+        for r in rec:
+            if r["q"] == end["q"]:                                       # the incoming one (the first frame is the one before it)
+                self.assertFalse(r["wait"], r)                            # its context read already, not still loading
+                self.assertLessEqual(abs(r["top"] - end["top"]), 1, (r, end))
+                if end["ctx"] is not None and r["ctx"] is not None:
+                    self.assertLessEqual(abs(r["ctx"] - end["ctx"]), 1, (r, end))
+        return rec
+
+    def test_a_slide_comes_in_at_its_final_height_whatever_the_one_leaving(self):
+        # one turn: a long text and a tall question, a short text and a short question, a medium text and a short one —
+        # the cards and the contexts of different heights, the tall one higher than the stage
+        long = "\n\n".join(f"Шаг {i}: проверила конфиг очереди, миграции и права сервиса — всё сходится, иду дальше по плану выката." for i in range(14))
+        self.ev("session.said", "backend", text=long)
+        self.ask("r1", "Длинный вопрос: " + " ".join(f"пункт {i} — что делаем с очередью повторов после выката?" for i in range(40)))
+        self.ev("session.said", "backend", text="Коротко: очередь готова.")
+        self.ask("r2", "Выкатываем на стейдж сейчас?")
+        self.ev("session.said", "backend", text="\n\n".join(f"Проверка {i}: всё зелёное." for i in range(5)))
+        self.ask("r3", "Как назовём новую очередь?")
+        self.opened({"until": f"{CTX}?.rows.length === 1", "ms": 8000},
+                    {"eval": "document.querySelector('.ag-layer .ag-stage').scrollTop = 120, 1"})
+        self.settle("document.querySelector('.ag-next').click()")          # the tall one leaves, scrolled
+        self.page({"until": f"{CUR}?.includes('Выкатываем') && {ONE}"})
+        self.settle("document.querySelector('.ag-next').click()")
+        self.page({"until": f"{CUR}?.includes('Как назовём') && {ONE}"})
+        self.settle("document.querySelector('.ag-prev').click()")
+        self.page({"until": f"{CUR}?.includes('Выкатываем') && {ONE}"})
+        self.settle("document.querySelector('.ag-prev').click()")          # the tall one comes in
+        self.page({"until": f"{CUR}?.includes('Длинный') && {ONE}"})
+        # an answer: the tall one flies up, the next comes in sideways at its own height
+        self.settle("document.querySelector('.ag-layer .ag-slide:not([inert]) label.opt').click()")
+        self.page({"until": f"{CUR}?.includes('Выкатываем') && {ONE}", "ms": 8000})
+
+    def test_another_sessions_slide_comes_in_at_its_final_height_with_its_context(self):
+        # ↓ and a chip go to another session: its context is read before the move (the feed slow from here on), the slide
+        # comes in with it, it does not jump up when the rows come
+        t = time.time() - 100
+        self.j.append("session.said", "backend", {"text": "Бэкенд: короткий текст."}, ts=t - 1)
+        self.ask("b1", "Бэкенд: первый?", ts=t)
+        self.ask("b2", "Бэкенд: второй?", ts=t + 1)
+        self.ask("b3", "Бэкенд: третий?", ts=t + 2)
+        for n, (name, icon) in enumerate((("infra", "🧱"), ("frontend", "🎨"))):
+            self.session(name, icon)
+            self.j.append("session.said", name, {"text": "\n\n".join(f"{name} шаг {i}: проверила миграции и права сервиса, всё сходится." for i in range(8))}, ts=t + 2.5 + n)
+            self.ask(f"{name[0]}1", f"{name}: выкатываем?", who=name, ts=t + 3 + n)
+        self.opened({"until": f"{self.BAR}?.chips.length === 3"}, {"until": f"{CTX}?.rows.length === 1", "ms": 8000},
+                    {"eval": SLOW})
+        self.settle("document.querySelector('.ag-layer').focus(), window.dispatchEvent(new KeyboardEvent('keydown', {key: 'ArrowDown', code: 'ArrowDown', bubbles: true, cancelable: true}))")
+        self.page({"until": f"{CUR}?.includes('infra') && {ONE}"})
+        self.settle("document.querySelector('.ag-layer .ag-chip[data-session=frontend]').click()")
+        self.page({"until": f"{CUR}?.includes('frontend') && {ONE}"})
 
     def test_an_answer_leaves_as_it_was_given_without_the_receipt_line(self):
         self.ask("r1", "Какие проверки добавить в CI?", multi=True)
@@ -338,6 +414,13 @@ class Gallery(e2e.PageInChrome):
         self.frames("document.querySelector('.ag-layer .ag-slide:not([inert]) label.opt').click()")
         self.page({"until": f"!document.querySelector('{LAYER}')", "ms": 8000})
         self.taken("r1", "r2", "r3", "r4")
+
+    def test_a_card_closed_without_an_answer_leaves_from_where_it_stood(self):
+        self.ask("r1", "Длинный вопрос: " + " ".join(f"пункт {i} — что делаем с очередью повторов?" for i in range(12)))
+        self.ask("r2", "Выкатываем на стейдж сейчас?")
+        self.opened()
+        self.frames("document.querySelector('.ag-layer .ag-slide:not([inert]) .card-x').click()")
+        self.page({"until": f"{CUR}?.includes('Выкатываем') && {ONE}", "ms": 8000})
 
     # the answers wait until the test lets them go (__release): then the core refuses them, or they go on to it (__pass)
     HOLD = ("window.__held = []; window.__pass = false; const f = window.fetch; window.fetch = (u, o) => String(u).includes('/api/answer')"
@@ -846,7 +929,6 @@ class Gallery(e2e.PageInChrome):
            " return {shown: !b.hidden && b.getClientRects().length > 0, who: document.querySelector('.ag-layer .ag-who').textContent.trim(),"
            " chips: [...b.querySelectorAll('.ag-chip')].map((c) => [c.dataset.session, +c.querySelector('.n').textContent,"
            " c.getAttribute('aria-current') === 'true'])}; })()")
-    ALL = "#slot-sidebar-header .ag-all"
     WHO = "document.querySelector('.ag-layer .ag-who')?.textContent.trim()"
 
     def three(self):
@@ -952,41 +1034,18 @@ class Gallery(e2e.PageInChrome):
         self.assertEqual(got[5]["eval"]["chips"], [["frontend", 2, True], ["backend", 2, False], ["infra", 1, False]])
         self.assertIn("Фронт: первый?", got[6]["eval"])
 
-    # the entry in the sidebar's search row: shown, its number and label, in the search row next to the "Waiting" pill
-    ENTRY = ("(() => { const b = document.querySelector('#slot-sidebar-header .ag-all'); if (!b) return {there: false};"
-             " const r = b.getBoundingClientRect(), row = b.closest('.search-row') || b.parentElement.parentElement, p = document.getElementById('wpill');"
-             " return {there: true, shown: !b.hidden && r.width > 0, n: b.querySelector('.ag-n').textContent, label: b.getAttribute('aria-label'),"
-             " h: Math.round(r.height), pillH: p && !p.hidden ? Math.round(p.getBoundingClientRect().height) : null,"
-             " inRow: r.top >= row.getBoundingClientRect().top - 1 && r.bottom <= row.getBoundingClientRect().bottom + 1,"
-             " fits: r.right <= innerWidth}; })()")
-
-    def test_the_sidebar_entry_shows_every_sessions_questions_and_opens_the_mode_from_the_first(self):
+    def test_the_sidebar_search_row_holds_nothing_of_the_plugin(self):
+        # the only entry is the session header's button: the sidebar's search row stays the page's own
         self.session("frontend", "🎨")
-        got = self.page({"go": f"http://127.0.0.1:{self.port}/#/s/frontend"}, {"until": "!!document.getElementById('slot-sidebar-header')", "ms": 15000},
-                        {"until": "!!document.querySelector('.slot-session-header')", "ms": 15000}, {"eval": self.ENTRY})
-        self.assertFalse(got[-1]["eval"].get("shown"))                   # no questions — no entry
         self.ask("b1", "Бэкенд: первый?", ts=time.time() - 10)
         self.ask("f1", "Фронт: первый?", who="frontend")
-        got = self.page({"until": f"!!document.querySelector('{self.ALL}:not([hidden])')", "ms": 8000},
-                        {"until": f"document.querySelector('{self.ALL} .ag-n').textContent === '2'", "ms": 8000}, {"eval": self.ENTRY},
-                        self.shot("entry-light.png", theme="light"), self.shot("entry-dark.png", theme="dark"))
-        e = got[2]["eval"]
-        self.assertEqual((e["shown"], e["n"], e["label"]), (True, "2", "Только вопросы всех сессий: открыто 2"))
-        self.assertTrue(e["inRow"] and e["fits"])
-        self.assertEqual(e["h"], e["pillH"])                              # as tall as the "Waiting for you" pill next to it
-        # from the frontend session's page, the sidebar entry starts at the list's first session, not the open one
-        got = self.page({"eval": f"document.querySelector('{self.ALL}').click(), 1"}, {"until": f"{self.BAR}?.chips.length === 2"},
-                        {"eval": self.BAR}, {"eval": CUR}, {"eval": "history.state?.askGallery"},
-                        {"eval": "location.reload(), 1"}, {"until": f"{self.BAR}?.chips.length === 2 && {COUNT} === '1 из 2'", "ms": 15000})
-        self.assertEqual(got[2]["eval"]["chips"], [["backend", 1, True], ["frontend", 1, False]])
-        self.assertIn("Бэкенд: первый?", got[3]["eval"])
-        self.assertEqual(got[4]["eval"], "*")
-        # answered elsewhere: the number goes down; none left — the entry goes too
-        got = self.page({"key": "Escape"}, {"until": f"!document.querySelector('{LAYER}')"})
-        self.ev("permission.answered", "backend", request_id="b1", behavior="allow", channel="telegram", owner=True, answers={"Бэкенд: первый?": "Да"})
-        self.page({"until": f"document.querySelector('{self.ALL} .ag-n').textContent === '1'", "ms": 8000})
-        self.ev("permission.answered", "frontend", request_id="f1", behavior="allow", channel="telegram", owner=True, answers={"Фронт: первый?": "Да"})
-        self.page({"until": f"!document.querySelector('{self.ALL}:not([hidden])')", "ms": 8000})
+        row = ("(() => { const h = document.getElementById('slot-sidebar-header');"
+               " return {there: !!h, nodes: h ? h.childNodes.length : null, ours: [...document.querySelectorAll('.ag-open')].filter((b) => !b.closest('.slot-session-header')).length}; })()")
+        got = self.page({"go": f"http://127.0.0.1:{self.port}/#/s/frontend"},
+                        {"until": f"document.querySelector('{OPEN}')?.getAttribute('aria-label') === 'Только вопросы: открыто 1'", "ms": 15000},
+                        {"until": "!!document.getElementById('wpill') && !document.getElementById('wpill').hidden", "ms": 8000}, {"eval": row},
+                        self.shot("sidebar-light.png", theme="light"), self.shot("sidebar-dark.png", theme="dark"))
+        self.assertEqual(got[3]["eval"], {"there": True, "nodes": 0, "ours": 0})
 
     def test_many_sessions_wrap_on_a_wide_screen_so_every_chip_is_in_reach_of_the_mouse(self):
         t = time.time() - 100
@@ -1056,13 +1115,11 @@ class Gallery(e2e.PageInChrome):
         pick = "document.querySelector('.ag-layer .ag-slide:not([inert]) label.opt').click(), 1"
         got = self.page({"go": f"http://127.0.0.1:{self.port}/#/s/hub"},
                         {"until": f"document.querySelector('{OPEN}')?.getAttribute('aria-label') === 'Только вопросы: открыто 2'", "ms": 15000},
-                        {"until": f"!!document.querySelector('{self.ALL}:not([hidden])')"}, {"eval": f"document.querySelector('{self.ALL} .ag-n').textContent"},
-                        {"eval": f"document.querySelector('{self.ALL}').click(), 1"}, {"until": f"{self.BAR}?.chips.length === 3"},
+                        {"eval": f"document.querySelector('{OPEN}').click(), 1"}, {"until": f"{self.BAR}?.chips.length === 3"},
                         {"eval": self.BAR}, {"eval": COUNT}, {"eval": CUR})
-        self.assertEqual(got[3]["eval"], "3")                             # no copy of b's question
-        self.assertEqual([c[:2] for c in got[6]["eval"]["chips"]], [["hub", 1], ["a", 1], ["b", 1]])
-        self.assertEqual(got[7]["eval"], "1 из 3")
-        self.assertIn("Вопрос хаба?", got[8]["eval"])
+        self.assertEqual([c[:2] for c in got[4]["eval"]["chips"]], [["hub", 1], ["a", 1], ["b", 1]])
+        self.assertEqual(got[5]["eval"], "1 из 3")                        # no copy of b's question
+        self.assertIn("Вопрос хаба?", got[6]["eval"])
         # the hub's own answered: its header button counts the shown one; opened from it — b's question first, then a's
         got = self.page({"eval": pick}, {"until": f"{CUR}?.includes('Вопрос a?') && {ONE}", "ms": 8000}, {"key": "Escape"},
                         {"until": f"!document.querySelector('{LAYER}')"},
