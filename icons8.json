@@ -1,0 +1,16 @@
+{
+  "version": 2,
+  "icons": {
+    "pack": "m_outlined",
+    "sizes": [16, 20],
+    "color": "currentColor",
+    "items": {
+      "back": { "id": "84994", "commonName": "back" },
+      "forward": { "id": "86517", "commonName": "forward" },
+      "ask": { "id": "86462", "commonName": "ask-question" },
+      "close": { "id": null, "commonName": "close", "source": "иконка хаба i-close из /static/icons.svg (hub.icon)" },
+      "question": { "id": null, "commonName": "?", "source": "глиф «?» строки сессии, которая ждёт вас (sidebar.js GLYPH.dialog), цвет --st-wait" }
+    }
+  },
+  "tokens": { "iconColor": "--foreground", "accent": "--primary", "radius": "--radius", "waiting": "--st-wait" }
+}
