@@ -1,5 +1,6 @@
-/* «Только вопросы»: слой на весь экран поверх страницы — шапка с именем сессии, карточка по центру и контекст слева, снизу стрелки */
-.ag-layer { position: fixed; inset: 0; z-index: 90; display: grid; grid-template-rows: auto minmax(0, 1fr) auto;
+/* «Только вопросы»: слой на весь экран поверх страницы — шапка с именем сессии, под ней сессии с вопросами, карточка по центру
+   и контекст слева, снизу стрелки */
+.ag-layer { position: fixed; inset: 0; z-index: 90; display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto;
   background: var(--background); color: var(--foreground); outline: 0; }
 .ag-top { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-3) var(--space-6);
   padding-top: calc(var(--space-3) + env(safe-area-inset-top)); border-bottom: 1px solid var(--border); }
@@ -13,8 +14,20 @@
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .ag-x .icon, .ag-nav .icon { width: 20px; height: 20px; }
 
+/* the sessions with questions (main.js chips): the page's "who · how many" chip (schedule.css .who-chip); the shown one is
+   pressed as the page's segmented buttons (feed.css .seg). Many sessions wrap; a narrow screen scrolls one row sideways */
+.ag-bar { grid-row: 2; position: relative; display: flex; flex-wrap: wrap; gap: var(--space-2);
+  padding: var(--space-2) var(--space-6); border-bottom: 1px solid var(--border); }
+.ag-bar[hidden] { display: none; }
+.ag-chip { flex: none; max-width: 16em; min-height: 32px; border-color: var(--input); }
+.ag-chip .ag-chip-t { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ag-chip .n { color: var(--muted-foreground); font-variant-numeric: tabular-nums; }
+.ag-chip[aria-current="true"] { background: var(--muted-2); border-color: var(--foreground); }   /* no bolder text: the row would shift */
+.ag-chip[aria-current="true"] .n { color: var(--foreground); }
+@media (pointer: coarse) { .ag-chip { min-height: 40px; } }
+
 /* the card sits in the middle; a tall one scrolls inside the stage (auto margins: its top never goes out of reach) */
-.ag-stage { grid-area: 2 / 1; display: grid; overflow: auto; overflow-x: hidden; padding: var(--space-6) var(--space-4); }
+.ag-stage { grid-area: 3 / 1; display: grid; overflow: auto; overflow-x: hidden; padding: var(--space-6) var(--space-4); }
 .ag-slide { grid-area: 1 / 1; width: min(680px, 100%); margin: auto; }
 .ag-slide > .card { margin: 0; box-shadow: var(--shadow-lift); }
 /* an answered card flies away showing what was picked (a single choice has no circle: the row keeps its hover tint) */
@@ -58,16 +71,20 @@
 .ag-open[hidden] { display: none; }
 .ag-open .ag-q { width: auto; color: var(--st-wait); font-weight: 700; }
 @media (max-width: 900px) { .ag-open .ag-t { display: none; } }   /* a narrow header: the glyph, the label in aria-label */
+/* the entry of every session's questions: in the sidebar's search row, as tall as its controls (sidebar.css --ctl-h) */
+.ag-all { min-width: var(--ctl-h); min-height: var(--ctl-h); height: var(--ctl-h); justify-content: center; font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums; }
 
 /* closed elsewhere while typed into (main.js freeze): only the text and the "Remove" bar stay usable */
 .ag-slide > .card.frozen :is(.btns, .card-x, .other-row .btn:not(.dictate)) { display: none; }   /* a recording finishes */
 
-.ag-nav { grid-row: 3; display: flex; align-items: center; justify-content: center; gap: var(--space-4);
+.ag-nav { grid-row: 4; display: flex; align-items: center; justify-content: center; gap: var(--space-4);
   padding: var(--space-3) var(--space-4) calc(var(--space-3) + env(safe-area-inset-bottom)); border-top: 1px solid var(--border); }
 .ag-count { min-width: 7ch; text-align: center; font-size: var(--text-sm); color: var(--muted-foreground);
   font-variant-numeric: tabular-nums; }
 
 @media (max-width: 720px) {
-  .ag-top { padding-inline: var(--space-4); }
+  .ag-top, .ag-bar { padding-inline: var(--space-4); }
+  .ag-bar { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
   .ag-stage { padding: var(--space-3) var(--space-3); }
 }

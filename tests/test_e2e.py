@@ -74,12 +74,17 @@ class Gallery(e2e.PageInChrome):
         self.ev("session.started", "backend", session_id="s-b")
         self.ev("turn.started", "backend", marker=None, prompt_head="x")
 
-    def ask(self, rid, *questions, multi=False):
-        self.ev("permission.requested", "backend", request_id=rid, tool="AskUserQuestion", interactive=True, input={
+    def ask(self, rid, *questions, multi=False, who="backend", ts=None):
+        self.j.append("permission.requested", who, {"request_id": rid, "tool": "AskUserQuestion", "interactive": True, "input": {
             "questions": [{"question": q, "multiSelect": multi, "header": "Выбор",
                            "options": [{"label": "Да", "description": "Делаем сейчас"}, {"label": "Нет"},
                                        {"label": "Позже", "description": "Вернёмся на следующей неделе"}]}
-                          for q in questions]})
+                          for q in questions]}}, ts=ts)
+
+    def session(self, name, icon):
+        self.ev("session.requested", name, session_id=f"s-{name}", cwd="/w", channel="cli", owner=True, icon=icon)
+        self.ev("session.started", name, session_id=f"s-{name}")
+        self.ev("turn.started", name, marker=None, prompt_head="x")
 
     def page(self, *steps):
         # cdp.mjs returns the last value of an "until" that timed out: here every wait must come true
@@ -92,23 +97,23 @@ class Gallery(e2e.PageInChrome):
     def shot(self, name, **kw):
         return {"shot": os.path.join(self.shots, name), "width": 1300, "height": 860, **kw}
 
-    def opened(self, *more, init=None):
-        go = {"go": f"http://127.0.0.1:{self.port}/#/s/backend", **({"init": init} if init else {})}
+    def opened(self, *more, init=None, at="backend"):
+        go = {"go": f"http://127.0.0.1:{self.port}/#/s/{at}", **({"init": init} if init else {})}
         return self.page(go, {"until": f"!!document.querySelector('{OPEN}')", "ms": 15000},
                          {"eval": f"document.querySelector('{OPEN}').click(), 1"},
                          {"until": f"!!document.querySelector('{LAYER} .ag-slide')"}, *more)
 
-    def taken(self, *rids):
+    def taken(self, *rids, who="backend"):
         end = time.time() + 8   # the card leaves at once, the core records the answer a moment later
-        while any(r in self.pending() for r in rids) and time.time() < end:
+        while any(r in self.pending(who) for r in rids) and time.time() < end:
             time.sleep(0.05)
         for r in rids:
-            self.assertNotIn(r, self.pending())
+            self.assertNotIn(r, self.pending(who))
 
-    def pending(self):
+    def pending(self, who="backend"):
         from core import journal, reducer   # the core's own fold of the test journal
         st = reducer.fold(reducer.empty(), journal.read(self.j.path))
-        s = st["sessions"]["backend"]   # a question form is an ask of the session; a tool permission — its pending
+        s = st["sessions"][who]   # a question form is an ask of the session; a tool permission — its pending
         return [r["request_id"] for r in (s.get("asks") or []) + (s.get("pending") or [])]
 
     def test_the_gallery_moves_answers_and_leaves_with_the_last_one(self):
@@ -127,6 +132,7 @@ class Gallery(e2e.PageInChrome):
         self.assertEqual(got[4]["eval"], "1 из 3")
         self.assertEqual(got[5]["eval"], 3)                            # the page's feed keeps its cards: nothing is folded
         self.assertEqual(got[6]["eval"].strip(), "🛠️ backend")
+        self.assertTrue(self.page({"eval": "document.querySelector('.ag-layer .ag-bar').hidden"})[0]["eval"])   # one session: no switcher
         self.assertTrue(got[7]["eval"])                                 # the page behind is out of reach
         self.assertIn("Какие проверки", got[11]["eval"])
         self.assertEqual(got[-2]["eval"], "1 из 3")
@@ -831,3 +837,242 @@ class Gallery(e2e.PageInChrome):
         for bg in tiles:
             a, b = sorted((lum((229, 72, 77)), lum(map(float, bg[bg.index("(") + 1:bg.index(")")].split(",")[:3]))))
             self.assertGreaterEqual((b + 0.05) / (a + 0.05), 3, bg)
+
+    # ---- every session's questions ----
+
+    # the sessions bar over the stage: each chip's session, its number of questions and whether it is the shown one; the
+    # header's session
+    BAR = ("(() => { const b = document.querySelector('.ag-layer .ag-bar'); if (!b) return null;"
+           " return {shown: !b.hidden && b.getClientRects().length > 0, who: document.querySelector('.ag-layer .ag-who').textContent.trim(),"
+           " chips: [...b.querySelectorAll('.ag-chip')].map((c) => [c.dataset.session, +c.querySelector('.n').textContent,"
+           " c.getAttribute('aria-current') === 'true'])}; })()")
+    ALL = "#slot-sidebar-header .ag-all"
+    WHO = "document.querySelector('.ag-layer .ag-who')?.textContent.trim()"
+
+    def three(self):
+        """Questions of three sessions: backend's two asked first, then infra's one, then frontend's two — the order of
+        "Waiting for you" in the list (the oldest question first), not the order the sessions were made in."""
+        self.session("frontend", "🎨")
+        self.session("infra", "🧱")
+        t = time.time() - 100
+        self.ask("b1", "Бэкенд: первый?", ts=t)
+        self.ask("b2", "Бэкенд: второй?", ts=t + 1)
+        self.ask("i1", "Инфра: единственный?", who="infra", ts=t + 2)
+        self.ask("f1", "Фронт: первый?", who="frontend", ts=t + 3)
+        self.ask("f2", "Фронт: второй?", who="frontend", ts=t + 4)
+
+    def test_every_sessions_questions_are_grouped_by_session_and_arrows_cross_between_them(self):
+        self.three()
+        got = self.opened({"until": f"{self.BAR}?.chips.length === 3"}, {"eval": self.BAR}, {"eval": COUNT}, {"eval": CUR},
+                          self.shot("all-light.png", theme="light"), self.shot("all-dark.png", theme="dark"))
+        bar = got[5]["eval"]
+        self.assertTrue(bar["shown"])
+        self.assertEqual(bar["chips"], [["backend", 2, True], ["infra", 1, False], ["frontend", 2, False]])
+        self.assertEqual(bar["who"], "🛠️ backend")
+        self.assertEqual(got[6]["eval"], "1 из 5")                        # one list: every session's questions
+        self.assertIn("Бэкенд: первый?", got[7]["eval"])
+        # → at the end of a session's questions: the next session's first one, the header and the shown chip go with it
+        got = self.page({"key": "ArrowRight"}, {"until": f"{COUNT} === '2 из 5' && {ONE}"},
+                        {"key": "ArrowRight"}, {"until": f"{COUNT} === '3 из 5' && {ONE}"}, {"eval": CUR}, {"eval": self.BAR},
+                        {"key": "ArrowLeft"}, {"until": f"{COUNT} === '2 из 5' && {ONE}"}, {"eval": CUR}, {"eval": self.BAR})
+        self.assertIn("Инфра: единственный?", got[4]["eval"])
+        self.assertEqual((got[5]["eval"]["who"], [c[2] for c in got[5]["eval"]["chips"]]), ("🧱 infra", [False, True, False]))
+        self.assertIn("Бэкенд: второй?", got[8]["eval"])                  # ← back over the edge: the previous session's last
+        self.assertEqual(got[9]["eval"]["who"], "🛠️ backend")
+        # ↓/↑ — the next and the previous session's first question; a chip — its session's first question
+        got = self.page({"key": "ArrowDown"}, {"until": f"{COUNT} === '3 из 5' && {ONE}"}, {"key": "ArrowDown"},
+                        {"until": f"{COUNT} === '4 из 5' && {ONE}"}, {"eval": CUR}, {"key": "ArrowDown"}, {"eval": COUNT},
+                        {"key": "ArrowUp"}, {"until": f"{COUNT} === '3 из 5' && {ONE}"},
+                        {"eval": "document.querySelector('.ag-layer .ag-chip[data-session=backend]').click(), 1"},
+                        {"until": f"{COUNT} === '1 из 5' && {ONE}"}, {"eval": self.BAR})
+        self.assertIn("Фронт: первый?", got[4]["eval"])
+        self.assertEqual(got[6]["eval"], "4 из 5")                        # the last session: nowhere further down
+        self.assertEqual([c[2] for c in got[-1]["eval"]["chips"]], [True, False, False])
+
+    def test_the_last_answer_of_a_session_brings_the_next_sessions_first_and_each_answer_goes_to_its_session(self):
+        self.three()
+        pick = "document.querySelector('.ag-layer .ag-slide:not([inert]) label.opt').click(), 1"
+        got = self.opened({"until": f"{self.BAR}?.chips.length === 3"}, {"key": "ArrowRight"}, {"until": f"{COUNT} === '2 из 5' && {ONE}"},
+                          {"eval": pick}, {"eval": self.MID}, {"eval": self.PLAY},
+                          {"until": f"{CUR}?.includes('Бэкенд: первый?') && {ONE}", "ms": 8000}, {"eval": COUNT}, {"eval": self.BAR})
+        # the last of backend's left answered while one of its own waits before it: the session's questions go on first
+        out, inn = self.mid(got[8]["eval"])
+        self.assertLess(out["y"], -50)
+        self.assertLess(inn["x"], -100)                                   # from the left: it was before it
+        self.assertEqual(got[11]["eval"], "1 из 4")
+        self.assertEqual(got[12]["eval"]["chips"][0], ["backend", 1, True])
+        self.taken("b2")
+        # backend's last one: it flies up, infra's first comes in from the right, the header changes with it
+        got = self.page({"eval": pick}, {"eval": self.MID}, {"eval": self.WHO}, {"eval": self.PLAY},
+                        {"until": f"{CUR}?.includes('Инфра: единственный?') && {ONE}", "ms": 8000}, {"eval": COUNT}, {"eval": self.BAR})
+        out, inn = self.mid(got[1]["eval"])
+        self.assertLess(out["y"], -50)
+        self.assertGreater(inn["x"], 100)
+        self.assertEqual(got[2]["eval"], "🧱 infra")                       # already while the slide comes in
+        self.assertEqual(got[5]["eval"], "1 из 3")
+        self.assertEqual(got[6]["eval"]["chips"], [["infra", 1, True], ["frontend", 2, False]])
+        self.taken("b1")
+        self.assertEqual(self.pending("infra"), ["i1"])                   # nothing went to another session
+        self.assertEqual(self.pending("frontend"), ["f1", "f2"])
+        # infra's answer goes to infra; then frontend's two; the last one closes the mode
+        got = self.page({"eval": pick}, {"until": f"{CUR}?.includes('Фронт: первый?') && {ONE}", "ms": 8000}, {"eval": self.BAR})
+        self.assertEqual(got[-1]["eval"]["chips"], [["frontend", 2, True]])   # one session left: the row stays, the stage does not jump
+        self.assertTrue(got[-1]["eval"]["shown"])
+        self.taken("i1", who="infra")
+        self.assertEqual(self.pending("frontend"), ["f1", "f2"])
+        self.page({"eval": pick}, {"until": f"{CUR}?.includes('Фронт: второй?') && {ONE}", "ms": 8000},
+                  {"eval": pick}, {"until": f"!document.querySelector('{LAYER}')", "ms": 8000})
+        self.taken("f1", "f2", who="frontend")
+        self.assertEqual(self.pending(), [])
+
+    def test_a_new_question_of_another_session_joins_its_group_without_moving_the_shown_card(self):
+        self.three()
+        got = self.opened({"until": f"{self.BAR}?.chips.length === 3"}, {"key": "ArrowRight"}, {"key": "ArrowRight"},
+                          {"until": f"{COUNT} === '3 из 5' && {ONE} && {CUR}?.includes('Инфра')"})
+        self.session("search", "🔎")
+        self.ask("s1", "Поиск: новый?", who="search")
+        self.ask("b3", "Бэкенд: третий?")
+        got = self.page({"until": f"{self.BAR}?.chips.length === 4 && {COUNT} === '4 из 7'", "ms": 8000},
+                        {"eval": self.BAR}, {"eval": CUR}, {"eval": "document.querySelectorAll('.ag-layer .ag-slide').length"})
+        self.assertEqual(got[1]["eval"]["chips"], [["backend", 3, False], ["infra", 1, True], ["frontend", 2, False], ["search", 1, False]])
+        self.assertIn("Инфра: единственный?", got[2]["eval"])            # the shown card stays where it was
+        self.assertEqual(got[3]["eval"], 1)                                # no move started
+        got = self.page({"key": "ArrowUp"}, {"until": f"{COUNT} === '1 из 7' && {ONE}"}, {"key": "ArrowRight"}, {"key": "ArrowRight"},
+                        {"until": f"{COUNT} === '3 из 7' && {ONE}"}, {"eval": CUR})
+        self.assertIn("Бэкенд: третий?", got[-1]["eval"])                # at the end of its session's group
+
+    def test_the_header_button_starts_with_its_session_and_goes_on_to_the_others(self):
+        self.three()
+        go = {"go": f"http://127.0.0.1:{self.port}/#/s/frontend"}
+        got = self.page(go, {"until": f"!!document.querySelector('{OPEN}')", "ms": 15000},
+                        {"eval": f"document.querySelector('{OPEN}').getAttribute('aria-label')"},
+                        {"eval": f"document.querySelector('{OPEN}').click(), 1"},
+                        {"until": f"{self.BAR}?.chips.length === 3"}, {"eval": self.BAR}, {"eval": CUR})
+        self.assertEqual(got[2]["eval"], "Только вопросы: открыто 2")    # the header counts its own session's
+        self.assertEqual(got[5]["eval"]["chips"], [["frontend", 2, True], ["backend", 2, False], ["infra", 1, False]])
+        self.assertIn("Фронт: первый?", got[6]["eval"])
+
+    # the entry in the sidebar's search row: shown, its number and label, in the search row next to the "Waiting" pill
+    ENTRY = ("(() => { const b = document.querySelector('#slot-sidebar-header .ag-all'); if (!b) return {there: false};"
+             " const r = b.getBoundingClientRect(), row = b.closest('.search-row') || b.parentElement.parentElement, p = document.getElementById('wpill');"
+             " return {there: true, shown: !b.hidden && r.width > 0, n: b.querySelector('.ag-n').textContent, label: b.getAttribute('aria-label'),"
+             " h: Math.round(r.height), pillH: p && !p.hidden ? Math.round(p.getBoundingClientRect().height) : null,"
+             " inRow: r.top >= row.getBoundingClientRect().top - 1 && r.bottom <= row.getBoundingClientRect().bottom + 1,"
+             " fits: r.right <= innerWidth}; })()")
+
+    def test_the_sidebar_entry_shows_every_sessions_questions_and_opens_the_mode_from_the_first(self):
+        self.session("frontend", "🎨")
+        got = self.page({"go": f"http://127.0.0.1:{self.port}/#/s/frontend"}, {"until": "!!document.getElementById('slot-sidebar-header')", "ms": 15000},
+                        {"until": "!!document.querySelector('.slot-session-header')", "ms": 15000}, {"eval": self.ENTRY})
+        self.assertFalse(got[-1]["eval"].get("shown"))                   # no questions — no entry
+        self.ask("b1", "Бэкенд: первый?", ts=time.time() - 10)
+        self.ask("f1", "Фронт: первый?", who="frontend")
+        got = self.page({"until": f"!!document.querySelector('{self.ALL}:not([hidden])')", "ms": 8000},
+                        {"until": f"document.querySelector('{self.ALL} .ag-n').textContent === '2'", "ms": 8000}, {"eval": self.ENTRY},
+                        self.shot("entry-light.png", theme="light"), self.shot("entry-dark.png", theme="dark"))
+        e = got[2]["eval"]
+        self.assertEqual((e["shown"], e["n"], e["label"]), (True, "2", "Только вопросы всех сессий: открыто 2"))
+        self.assertTrue(e["inRow"] and e["fits"])
+        self.assertEqual(e["h"], e["pillH"])                              # as tall as the "Waiting for you" pill next to it
+        # from the frontend session's page, the sidebar entry starts at the list's first session, not the open one
+        got = self.page({"eval": f"document.querySelector('{self.ALL}').click(), 1"}, {"until": f"{self.BAR}?.chips.length === 2"},
+                        {"eval": self.BAR}, {"eval": CUR}, {"eval": "history.state?.askGallery"},
+                        {"eval": "location.reload(), 1"}, {"until": f"{self.BAR}?.chips.length === 2 && {COUNT} === '1 из 2'", "ms": 15000})
+        self.assertEqual(got[2]["eval"]["chips"], [["backend", 1, True], ["frontend", 1, False]])
+        self.assertIn("Бэкенд: первый?", got[3]["eval"])
+        self.assertEqual(got[4]["eval"], "*")
+        # answered elsewhere: the number goes down; none left — the entry goes too
+        got = self.page({"key": "Escape"}, {"until": f"!document.querySelector('{LAYER}')"})
+        self.ev("permission.answered", "backend", request_id="b1", behavior="allow", channel="telegram", owner=True, answers={"Бэкенд: первый?": "Да"})
+        self.page({"until": f"document.querySelector('{self.ALL} .ag-n').textContent === '1'", "ms": 8000})
+        self.ev("permission.answered", "frontend", request_id="f1", behavior="allow", channel="telegram", owner=True, answers={"Фронт: первый?": "Да"})
+        self.page({"until": f"!document.querySelector('{self.ALL}:not([hidden])')", "ms": 8000})
+
+    def test_many_sessions_wrap_on_a_wide_screen_so_every_chip_is_in_reach_of_the_mouse(self):
+        t = time.time() - 100
+        for i in range(12):
+            self.session(f"worker-{i:02d}", "🛠️")
+            self.ask(f"w{i}", f"Вопрос {i}?", who=f"worker-{i:02d}", ts=t + i)
+        seen = ("(() => { const b = document.querySelector('.ag-layer .ag-bar'), r = b.getBoundingClientRect();"
+                " return [...b.querySelectorAll('.ag-chip')].every((c) => { const x = c.getBoundingClientRect();"
+                " return x.left >= r.left && x.right <= r.right && x.bottom <= r.bottom; }); })()")
+        got = self.opened({"until": f"{self.BAR}?.chips.length === 12"}, {"eval": seen}, self.shot("all-many-light.png", theme="light"), at="worker-00")
+        self.assertTrue(got[5]["eval"])
+
+    def test_the_switcher_on_a_phone_scrolls_sideways_and_keeps_the_page_width(self):
+        self.three()
+        self.session("search-and-indexing-service", "🔎")
+        self.ask("s1", "Поиск: новый?", who="search-and-indexing-service")
+        fit = ("(() => { const b = document.querySelector('.ag-layer .ag-bar'), c = b.querySelector('[aria-current=true]').getBoundingClientRect();"
+               " return {page: document.documentElement.scrollWidth <= innerWidth, bar: b.scrollWidth > b.clientWidth,"
+               " cur: c.left >= 0 && c.right <= innerWidth, h: Math.round(c.height)}; })()")
+        got = self.opened({"touch": True}, self.shot("all-phone-light.png", width=390, height=780, theme="light"),
+                          {"until": f"{self.BAR}?.chips.length === 4"}, {"eval": fit},
+                          {"eval": "document.querySelector('.ag-layer .ag-chip[data-session=search-and-indexing-service]').click(), 1"},
+                          {"until": f"{COUNT} === '6 из 6' && {ONE}"}, {"eval": fit},
+                          self.shot("all-phone-dark.png", width=390, height=780, theme="dark"))
+        first, last = got[7]["eval"], got[10]["eval"]
+        self.assertTrue(first["page"] and first["bar"] and first["cur"])
+        self.assertGreaterEqual(first["h"], 40)                            # a finger's target
+        self.assertTrue(last["page"] and last["cur"])                      # the far chip scrolled into sight
+
+    def test_up_and_down_inside_a_card_scroll_it_and_leave_the_session_alone(self):
+        self.session("infra", "🧱")
+        self.ask("b1", *[f"Бэкенд: вопрос {i}?" for i in range(6)], multi=True, ts=time.time() - 10)
+        self.ask("i1", "Инфра: единственный?", who="infra")
+        stage = "document.querySelector('.ag-layer .ag-stage')"
+        got = self.opened({"until": f"{self.BAR}?.chips.length === 2"},
+                          {"eval": "document.querySelector('.ag-layer .ag-slide:not([inert]) input[type=checkbox]').focus(), 1"},
+                          {"eval": f"{stage}.scrollTop"}, {"key": "ArrowDown"}, {"key": "ArrowDown"},
+                          {"until": f"{stage}.scrollTop > 0"}, {"eval": COUNT},
+                          {"eval": "document.querySelector('.ag-layer .ag-slide:not([inert]) textarea.other').focus(), 1"},
+                          {"key": "ArrowDown"}, {"eval": COUNT},
+                          {"eval": "document.querySelector('.ag-layer').focus(), 1"}, {"key": "ArrowDown"},
+                          {"until": f"{COUNT} === '2 из 2' && {ONE}"}, {"eval": CUR})
+        self.assertEqual(got[6]["eval"], 0)
+        self.assertEqual(got[10]["eval"], "1 из 2")                      # a checkbox: the card scrolled, the session stayed
+        self.assertEqual(got[13]["eval"], "1 из 2")                      # a text field: its own arrows
+        self.assertIn("Инфра: единственный?", got[-1]["eval"])           # outside the card: the next session
+
+    def hub_with_a_shown_question(self):
+        """The hub with a question of its own asked last, two sessions, and the hub showing session b's question in its
+        chat (hub question show): the same question in b's pending and in the hub's shown."""
+        from core import journal, reducer
+        self.ev("session.requested", "hub", session_id="s-h", cwd="/h", kind="hub", channel="cli", owner=True)
+        self.ev("session.started", "hub", session_id="s-h")
+        self.ev("turn.started", "hub", marker=None, prompt_head="x")
+        self.session("a", "🅰️")
+        self.session("b", "🅱️")
+        t = time.time() - 100
+        self.ask("ra", "Вопрос a?", who="a", ts=t)
+        self.ask("rb", "Вопрос b?", who="b", ts=t + 1)
+        self.ask("rh", "Вопрос хаба?", who="hub", ts=t + 2)
+        st = reducer.fold(reducer.empty(), journal.read(self.j.path))
+        qid = st["sessions"]["b"]["asks"][0]["id"]
+        self.ev("question.shown", "b", id=qid, channel="session", owner=False, sender="hub")
+
+    def test_the_hub_goes_first_and_a_question_it_shows_in_its_chat_comes_once_in_its_askers_group(self):
+        self.hub_with_a_shown_question()
+        pick = "document.querySelector('.ag-layer .ag-slide:not([inert]) label.opt').click(), 1"
+        got = self.page({"go": f"http://127.0.0.1:{self.port}/#/s/hub"},
+                        {"until": f"document.querySelector('{OPEN}')?.getAttribute('aria-label') === 'Только вопросы: открыто 2'", "ms": 15000},
+                        {"until": f"!!document.querySelector('{self.ALL}:not([hidden])')"}, {"eval": f"document.querySelector('{self.ALL} .ag-n').textContent"},
+                        {"eval": f"document.querySelector('{self.ALL}').click(), 1"}, {"until": f"{self.BAR}?.chips.length === 3"},
+                        {"eval": self.BAR}, {"eval": COUNT}, {"eval": CUR})
+        self.assertEqual(got[3]["eval"], "3")                             # no copy of b's question
+        self.assertEqual([c[:2] for c in got[6]["eval"]["chips"]], [["hub", 1], ["a", 1], ["b", 1]])
+        self.assertEqual(got[7]["eval"], "1 из 3")
+        self.assertIn("Вопрос хаба?", got[8]["eval"])
+        # the hub's own answered: its header button counts the shown one; opened from it — b's question first, then a's
+        got = self.page({"eval": pick}, {"until": f"{CUR}?.includes('Вопрос a?') && {ONE}", "ms": 8000}, {"key": "Escape"},
+                        {"until": f"!document.querySelector('{LAYER}')"},
+                        {"until": f"document.querySelector('{OPEN}')?.getAttribute('aria-label') === 'Только вопросы: открыто 1'", "ms": 8000},
+                        {"eval": f"document.querySelector('{OPEN}').click(), 1"}, {"until": f"{self.BAR}?.chips.length === 2"},
+                        {"eval": self.BAR}, {"eval": CUR})
+        self.assertEqual([c[:2] for c in got[7]["eval"]["chips"]], [["b", 1], ["a", 1]])
+        self.assertIn("Вопрос b?", got[8]["eval"])
+        self.taken("rh", who="hub")
+        # the answer to the shown question goes to b, its asker
+        self.page({"eval": pick}, {"until": f"{CUR}?.includes('Вопрос a?') && {ONE}", "ms": 8000})
+        self.taken("rb", who="b")
+        self.assertEqual(self.pending("a"), ["ra"])
